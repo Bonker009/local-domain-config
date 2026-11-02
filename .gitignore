@@ -1,0 +1,6 @@
+certs/
+nginx/logs/
+nginx/temp/
+nginx/conf/sites/
+hosts.backup
+*.pem

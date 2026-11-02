@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kshrd.app sample</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 16px/1.5 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; }
+  main { width: min(32rem, 100%); padding: 2rem; box-sizing: border-box; }
+  h1 { margin: 0 0 1rem; font-size: 1.75rem; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .5rem 1rem; margin: 0; }
+  dt { color: #52606d; }
+  dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sample app</h1>
+  <dl>
+    <dt>Page URL</dt><dd id="url"></dd>
+    <dt>Secure context</dt><dd id="secure"></dd>
+    <dt>Host seen by app</dt><dd id="host">...</dd>
+    <dt>Forwarded protocol</dt><dd id="proto">...</dd>
+    <dt>App port</dt><dd id="port">...</dd>
+    <dt>WebSocket</dt><dd id="ws">connecting...</dd>
+  </dl>
+</main>
+<script>
+  const show = (id, value) => { document.getElementById(id).textContent = value; };
+
+  show('url', location.href);
+  show('secure', window.isSecureContext ? 'Yes' : 'No');
+
+  fetch('/api/info').then((r) => r.json()).then((info) => {
+    show('host', info.host);
+    show('proto', info.forwardedProto ?? 'none (not going through the proxy)');
+    show('port', info.appPort);
+  });
+
+  function connect() {
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${scheme}://${location.host}/ws`);
+    socket.onmessage = (event) => show('ws', `connected (${scheme}), server time ${event.data}`);
+    socket.onclose = () => { show('ws', 'disconnected, retrying...'); setTimeout(connect, 1000); };
+  }
+  connect();
+</script>
+</body>
+</html>

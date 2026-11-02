@@ -1,0 +1,10 @@
+#!/bin/sh
+# Bash can't run kshrd.cmd by bare name, so this calls kshrd.ps1 directly.
+# Works in Git Bash (cygpath) and WSL (wslpath).
+dir=$(dirname "$(readlink -f "$0")")
+if command -v cygpath >/dev/null 2>&1; then
+  win=$(cygpath -w "$dir")
+else
+  win=$(wslpath -w "$dir")
+fi
+exec pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$win\kshrd.ps1" "$@"

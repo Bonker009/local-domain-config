@@ -1,0 +1,7 @@
+{
+  "name": "kshrd-sample-app",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  }
+}
