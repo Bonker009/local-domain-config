@@ -32,6 +32,8 @@ nginx does not start with Windows unless you run `kshrd autostart on`. Otherwise
 
 Certificates last a little over two years. `kshrd start` and `kshrd setup` reissue any that have under 30 days left, and `kshrd doctor` warns about them.
 
+Output is coloured in a terminal. Set the `NO_COLOR` environment variable to turn that off.
+
 Changing the hosts file shows a Windows admin prompt. Nothing else needs admin rights.
 
 A name containing a dot is used as the full domain. It gets its own certificate in `certs/`, which `kshrd remove` deletes and `kshrd setup` reissues if it is missing. Add `www.shop.test` separately if you want it too.

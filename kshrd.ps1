@@ -19,7 +19,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$AppVersion = '1.1.0'
+$AppVersion = '1.1.1'
 $Domain     = 'kshrd.app'
 # Traefik (Docker) owns the wildcard on 80/443. A dedicated loopback address keeps both proxies working.
 $ListenIp   = '127.0.0.2'
@@ -37,9 +37,36 @@ $RenewDays  = 30
 $RunKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $LogDir     = Join-Path $Root 'nginx\logs'
 
+function Write-Color([string]$Text, [string]$Color, [switch]$NoNewline) {
+    # https://no-color.org: any non-empty NO_COLOR turns colour off.
+    $style = @{ NoNewline = [bool]$NoNewline }
+    if ($Color -and -not $env:NO_COLOR) { $style.ForegroundColor = $Color }
+    Write-Host $Text @style
+}
+
+function Write-Done([string]$Message) { Write-Color $Message 'Green' }
+
+function Write-Heading([string]$Text) { Write-Color $Text 'Yellow' }
+
+function Write-Row([string]$Left, [string]$Color, [string]$Right, [int]$Width) {
+    Write-Color ("  {0,-$Width} " -f $Left) $Color -NoNewline
+    Write-Host $Right
+}
+
 function Fail([string]$Message) {
-    Write-Host "error: $Message" -ForegroundColor Red
+    Write-Color 'error: ' 'Red' -NoNewline
+    Write-Host $Message
     exit 1
+}
+
+function Write-LogLine([string]$Line) {
+    $color = switch -Regex ($Line) {
+        '" 5\d\d '                         { 'Red'; break }
+        '\[(error|crit|alert|emerg)\]'      { 'Red'; break }
+        '" 4\d\d '                         { 'Yellow'; break }
+        '\[warn\]'                          { 'Yellow'; break }
+    }
+    Write-Color $Line $color
 }
 
 function Get-Tool([string]$Tool) {
@@ -131,7 +158,7 @@ function Invoke-Mkcert([string]$BaseName, [string[]]$Names) {
     }
     Move-Item $newCert (Join-Path $CertDir "$BaseName.pem") -Force
     Move-Item $newKey (Join-Path $CertDir "$BaseName-key.pem") -Force
-    Write-Host ("Issued the certificate for {0}, valid until {1:yyyy-MM-dd}." -f $BaseName, (Get-CertExpiry (Join-Path $CertDir "$BaseName.pem")))
+    Write-Done ("Issued the certificate for {0}, valid until {1:yyyy-MM-dd}." -f $BaseName, (Get-CertExpiry (Join-Path $CertDir "$BaseName.pem")))
     $true
 }
 
@@ -265,7 +292,7 @@ function Start-Nginx {
     Start-Process (Get-Tool 'nginx') -ArgumentList '-p', $Prefix, '-c', 'conf/nginx.conf' `
         -WorkingDirectory $Prefix -WindowStyle Hidden
     foreach ($i in 1..20) {
-        if (Test-NginxRunning) { Write-Host 'nginx started.'; return }
+        if (Test-NginxRunning) { Write-Done 'nginx started.'; return }
         Start-Sleep -Milliseconds 250
     }
     Get-Content (Join-Path $Root 'nginx\logs\error.log') -Tail 5 -ErrorAction SilentlyContinue | Write-Host
@@ -278,7 +305,7 @@ function Stop-Nginx {
     $result = Invoke-Nginx -s stop
     if (-not $result.Ok) { Fail $result.Output }
     Wait-Process -Id $id -Timeout 10 -ErrorAction SilentlyContinue
-    Write-Host 'nginx stopped.'
+    Write-Done 'nginx stopped.'
 }
 
 function Update-Nginx {
@@ -287,7 +314,7 @@ function Update-Nginx {
         if (-not $result.Ok) { Fail $result.Output }
         # The signal returns before the new worker has taken over.
         Start-Sleep -Milliseconds 500
-        Write-Host 'nginx reloaded.'
+        Write-Done 'nginx reloaded.'
     } else {
         Start-Nginx
     }
@@ -346,7 +373,7 @@ function Sync-Hosts([switch]$Clear) {
     if ([IO.File]::ReadAllText($HostsFile) -cne $wanted) {
         Fail 'the hosts file was not updated. Security software may be blocking the change.'
     }
-    Write-Host 'Hosts file updated.'
+    Write-Done 'Hosts file updated.'
 }
 
 function Test-Port([int]$AppPort) {
@@ -364,15 +391,17 @@ function Test-Port([int]$AppPort) {
 }
 
 function Show-Status {
-    Write-Host ("nginx: {0}" -f $(if (Test-NginxRunning) { 'running' } else { 'stopped' }))
+    Write-Host 'nginx: ' -NoNewline
+    if (Test-NginxRunning) { Write-Color 'running' 'Green' } else { Write-Color 'stopped' 'Red' }
     $sites = Get-Sites
     if (-not $sites.Count) { Write-Host "No sites yet. Run 'kshrd setup'."; return }
     foreach ($hostname in $sites.Keys) {
         $appPort = $sites[$hostname]
-        $target = if ($null -eq $appPort) { 'placeholder page' }
-                  elseif (Test-Port $appPort) { "localhost:$appPort (up)" }
-                  else { "localhost:$appPort (DOWN)" }
-        Write-Host ("  https://{0,-30} {1}" -f $hostname, $target)
+        $target, $color = if ($null -eq $appPort) { 'placeholder page', 'DarkGray' }
+                          elseif (Test-Port $appPort) { "localhost:$appPort (up)", 'Green' }
+                          else { "localhost:$appPort (DOWN)", 'Red' }
+        Write-Color ("  https://{0,-30} " -f $hostname) 'Cyan' -NoNewline
+        Write-Color $target $color
     }
 }
 
@@ -407,7 +436,7 @@ function Invoke-Open {
     $hostname = Get-RegisteredHostname
     if (-not (Test-NginxRunning)) { Fail "nginx is not running. Run 'kshrd start' first." }
     Start-Process "https://$hostname"
-    Write-Host "Opened https://$hostname"
+    Write-Done "Opened https://$hostname"
 }
 
 function Invoke-Logs {
@@ -417,17 +446,17 @@ function Invoke-Logs {
     if ($Follow) {
         $path = if ($Errors) { $errorLog } else { $access }
         if (-not (Test-Path $path)) { Fail "no log for $hostname yet. If nginx has been running since before this update, run 'kshrd restart'." }
-        Write-Host "Following $path. Press Ctrl+C to stop."
-        Get-Content $path -Tail 20 -Wait
+        Write-Color "Following $path. Press Ctrl+C to stop." 'DarkGray'
+        Get-Content $path -Tail 20 -Wait | ForEach-Object { Write-LogLine $_ }
         return
     }
     $sections = [ordered]@{}
     if (-not $Errors) { $sections['Requests'] = $access }
     $sections['Errors'] = $errorLog
     foreach ($title in $sections.Keys) {
-        Write-Host "== $title =="
+        Write-Heading "== $title =="
         $lines = if (Test-Path $sections[$title]) { Get-Content $sections[$title] -Tail 30 }
-        if ($lines) { $lines | Write-Host } else { Write-Host '(empty)' }
+        if ($lines) { $lines | ForEach-Object { Write-LogLine $_ } } else { Write-Color '(empty)' 'DarkGray' }
     }
 }
 
@@ -442,11 +471,11 @@ function Invoke-Autostart {
             $shell = (Get-Process -Id $PID).Path
             $value = "`"$shell`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" start"
             Set-ItemProperty -Path $RunKey -Name 'kshrd' -Value $value
-            Write-Host 'nginx will start when you log in to Windows.'
+            Write-Done 'nginx will start when you log in to Windows.'
         }
         'off' {
             Remove-ItemProperty -Path $RunKey -Name 'kshrd' -ErrorAction SilentlyContinue
-            Write-Host 'nginx will no longer start when you log in.'
+            Write-Done 'nginx will no longer start when you log in.'
         }
         'status' {
             Write-Host ('Autostart is {0}.' -f $(if (Get-AutostartCommand) { 'on' } else { 'off' }))
@@ -507,9 +536,12 @@ function Write-Check([ValidateSet('ok', 'warn', 'fail')][string]$Level, [string]
     }
     if ($Level -eq 'warn') { $script:DoctorWarnings++ }
     Write-Host '[' -NoNewline
-    Write-Host $label -NoNewline -ForegroundColor $color
+    Write-Color $label $color -NoNewline
     Write-Host "] $Message"
-    if ($Fix) { Write-Host "       fix: $Fix" }
+    if ($Fix) {
+        Write-Color '       fix: ' 'DarkGray' -NoNewline
+        Write-Color $Fix 'Cyan'
+    }
 }
 
 function Invoke-Doctor {
@@ -628,7 +660,8 @@ function Invoke-Doctor {
     }
 
     Write-Host ''
-    Write-Host "$($script:DoctorFailures) problem(s), $($script:DoctorWarnings) warning(s)."
+    $color = if ($script:DoctorFailures) { 'Red' } elseif ($script:DoctorWarnings) { 'Yellow' } else { 'Green' }
+    Write-Color "$($script:DoctorFailures) problem(s), $($script:DoctorWarnings) warning(s)." $color
     if ($script:DoctorFailures) { exit 1 }
 }
 
@@ -679,7 +712,8 @@ function Invoke-Add {
     $sites[$hostname] = $Port
     New-OwnCerts $sites
     Set-Sites $sites
-    Write-Host "https://$hostname -> localhost:$Port"
+    Write-Color "https://$hostname" 'Cyan' -NoNewline
+    Write-Host " -> localhost:$Port"
     if (Test-OwnCert $hostname) {
         Write-Host "Note: if $hostname is a real site on the internet, this PC can't reach it until you remove this entry."
     }
@@ -704,7 +738,7 @@ function Invoke-Remove {
         # A worker that is still finishing may hold these open, so this is best effort.
         Remove-Item (Join-Path $LogDir "$hostname.access.log"), (Join-Path $LogDir "$hostname.error.log") -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "Removed $hostname."
+    Write-Done "Removed $hostname."
 }
 
 function Invoke-Teardown {
@@ -714,7 +748,7 @@ function Invoke-Teardown {
         & (Get-Tool 'mkcert') -uninstall
         if ($LASTEXITCODE -ne 0) { Fail 'mkcert -uninstall failed.' }
     }
-    Write-Host "Torn down. sites.json is kept, so 'kshrd setup' restores everything."
+    Write-Done "Torn down. sites.json is kept, so 'kshrd setup' restores everything."
 }
 
 $HelpTopics = [ordered]@{
@@ -843,8 +877,8 @@ $HelpTopics = [ordered]@{
 }
 
 function Write-Examples($Examples) {
-    Write-Host 'Examples:'
-    foreach ($example in $Examples) { Write-Host ('  {0,-30} {1}' -f $example[0], $example[1]) }
+    Write-Heading 'Examples:'
+    foreach ($example in $Examples) { Write-Row $example[0] 'Green' $example[1] 30 }
 }
 
 function Show-Help([string]$Topic) {
@@ -852,7 +886,8 @@ function Show-Help([string]$Topic) {
         $key = $Topic.ToLowerInvariant()
         if (-not $HelpTopics.Contains($key)) { Fail "unknown command '$Topic'. Run 'kshrd help' for the list." }
         $entry = $HelpTopics[$key]
-        Write-Host "Usage: $($entry.Usage)"
+        Write-Heading 'Usage:'
+        Write-Color "  $($entry.Usage)" 'Cyan'
         Write-Host ''
         Write-Host $entry.Summary
         Write-Host $entry.Details
@@ -860,19 +895,21 @@ function Show-Help([string]$Topic) {
         Write-Examples $entry.Examples
         return
     }
-    Write-Host "kshrd - local HTTPS reverse proxy for $Domain or any custom domain (this PC only)"
+    Write-Color 'kshrd' 'Cyan' -NoNewline
+    Write-Host " $AppVersion - local HTTPS reverse proxy for $Domain or any custom domain (this PC only)"
     Write-Host ''
-    Write-Host 'Usage: kshrd <command> [arguments]'
+    Write-Heading 'Usage:'
+    Write-Host '  kshrd <command> [arguments]'
     Write-Host ''
-    Write-Host 'Commands:'
+    Write-Heading 'Commands:'
     foreach ($key in $HelpTopics.Keys) {
-        Write-Host ('  {0,-36} {1}' -f $HelpTopics[$key].Usage.Substring(6), $HelpTopics[$key].Summary)
+        Write-Row $HelpTopics[$key].Usage.Substring(6) 'Cyan' $HelpTopics[$key].Summary 36
     }
     Write-Host ''
-    Write-Host 'Names:'
-    Write-Host ('  {0,-36} {1}' -f 'demo', "A subdomain: https://demo.$Domain")
-    Write-Host ('  {0,-36} {1}' -f $Domain, 'The main site')
-    Write-Host ('  {0,-36} {1}' -f 'shop.test', 'A custom domain, used exactly as written, with its own certificate')
+    Write-Heading 'Names:'
+    Write-Row 'demo' 'Cyan' "A subdomain: https://demo.$Domain" 36
+    Write-Row $Domain 'Cyan' 'The main site' 36
+    Write-Row 'shop.test' 'Cyan' 'A custom domain, used exactly as written, with its own certificate' 36
     Write-Host ''
     Write-Examples @(
         @('kshrd setup', 'First run on this PC'),

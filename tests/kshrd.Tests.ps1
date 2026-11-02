@@ -195,3 +195,46 @@ Describe 'kshrd logs sections' {
         $output | Should Not Match '== Requests =='
     }
 }
+
+Describe 'Colour' {
+    Mock Write-Host {}
+
+    It 'uses the colour by default' {
+        $env:NO_COLOR = $null
+        Write-Color 'text' 'Green'
+        Assert-MockCalled Write-Host -Exactly 1 -Scope It -ParameterFilter { $ForegroundColor -eq 'Green' }
+    }
+    It 'drops the colour when NO_COLOR is set' {
+        $env:NO_COLOR = '1'
+        Write-Color 'text' 'Green'
+        $env:NO_COLOR = $null
+        Assert-MockCalled Write-Host -Exactly 0 -Scope It -ParameterFilter { $ForegroundColor }
+        Assert-MockCalled Write-Host -Exactly 1 -Scope It
+    }
+    It 'writes plain text when no colour is given' {
+        Write-Color 'text' ''
+        Assert-MockCalled Write-Host -Exactly 0 -Scope It -ParameterFilter { $ForegroundColor }
+    }
+    foreach ($case in @(
+        @('127.0.0.1 - - [x] "GET / HTTP/1.1" 500 10 "-" "c"', 'Red'),
+        @('127.0.0.1 - - [x] "GET / HTTP/1.1" 404 10 "-" "c"', 'Yellow'),
+        @('2026/11/02 12:00:00 [error] 1#1: failed', 'Red'),
+        @('2026/11/02 12:00:00 [warn] 1#1: careful', 'Yellow')
+    )) {
+        It "colours a log line as $($case[1]): $($case[0])" {
+            $expected = $case[1]
+            Write-LogLine $case[0]
+            Assert-MockCalled Write-Host -Exactly 1 -Scope It -ParameterFilter { $ForegroundColor -eq $expected }
+        }
+    }
+    It 'leaves a successful request uncoloured' {
+        Write-LogLine '127.0.0.1 - - [x] "GET / HTTP/1.1" 200 10 "-" "c"'
+        Assert-MockCalled Write-Host -Exactly 0 -Scope It -ParameterFilter { $ForegroundColor }
+    }
+}
+
+Describe 'Redirected output' {
+    It 'contains no colour codes' {
+        (Invoke-Kshrd help).Output | Should Not Match ([char]27)
+    }
+}
