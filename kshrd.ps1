@@ -10,11 +10,13 @@ param(
     [Parameter(Position = 2)][int]$Port,
     [switch]$RemoveCA,
     [switch]$ClearHosts,
-    [Alias('h')][switch]$Help
+    [Alias('h')][switch]$Help,
+    [Alias('v')][switch]$Version
 )
 
 $ErrorActionPreference = 'Stop'
 
+$AppVersion = '1.1.0'
 $Domain     = 'kshrd.app'
 # Traefik (Docker) owns the wildcard on 80/443. A dedicated loopback address keeps both proxies working.
 $ListenIp   = '127.0.0.2'
@@ -458,6 +460,12 @@ $HelpTopics = [ordered]@{
             @('kshrd teardown -RemoveCA', 'Also remove the local CA')
         )
     }
+    version  = @{
+        Usage    = 'kshrd version'
+        Summary  = 'Show the kshrd version'
+        Details  = 'kshrd --version and -v do the same.'
+        Examples = @(, @('kshrd version', 'Show the version'))
+    }
     help     = @{
         Usage    = 'kshrd help [command]'
         Summary  = 'Show this list, or the details of one command'
@@ -514,6 +522,14 @@ function Show-Help([string]$Topic) {
     Write-Host "Run 'kshrd help <command>' for details."
 }
 
+# Dot-sourced by the tests, which only want the functions above.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+if ($Version -or $Command -eq '--version') {
+    Write-Host "kshrd $AppVersion"
+    exit 0
+}
+
 $HelpFlags = '--help', '-help', '-h', '/?'
 if ($Help -or $Command -in $HelpFlags -or $Name -in $HelpFlags) {
     # 'help' is also the default command, so a bare 'kshrd -h' must show the full list.
@@ -532,6 +548,7 @@ switch ($Command.ToLowerInvariant()) {
     'stop'         { Stop-Nginx }
     'restart'      { Stop-Nginx; Start-Nginx }
     'teardown'     { Invoke-Teardown }
+    'version'      { Write-Host "kshrd $AppVersion" }
     'help'         { Show-Help $Name }
     '_write-hosts' { Write-HostsFile }
     default        { Fail "unknown command '$Command'. Run 'kshrd help' for the list." }
