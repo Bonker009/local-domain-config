@@ -238,3 +238,51 @@ Describe 'Redirected output' {
         (Invoke-Kshrd help).Output | Should Not Match ([char]27)
     }
 }
+
+Describe 'Split-TextToWidth' {
+    It 'keeps short text on one line' { @(Split-TextToWidth 'short text' 20).Count | Should Be 1 }
+    It 'wraps on spaces' { (@(Split-TextToWidth 'one two three' 7) -join '|') | Should Be 'one two|three' }
+    It 'breaks a word longer than the line' { (@(Split-TextToWidth 'abcdefghij' 4) -join '|') | Should Be 'abcd|efgh|ij' }
+    It 'returns one empty line for empty text' { @(Split-TextToWidth '' 5).Count | Should Be 1 }
+}
+
+Describe 'Get-ColumnWidths' {
+    It 'keeps widths that already fit' { (Get-ColumnWidths @(10, 20) 100) -join ',' | Should Be '10,20' }
+    It 'shrinks the widest column first' { (Get-ColumnWidths @(10, 80) 60) -join ',' | Should Be '10,43' }
+    It 'never shrinks below the minimum' { (Get-ColumnWidths @(30, 30) 5) -join ',' | Should Be '8,8' }
+}
+
+Describe 'Write-Table' {
+    $script:lines = @()
+    $script:current = ''
+    Mock Write-Host {
+        $script:current += "$Object"
+        if (-not $NoNewline) { $script:lines += $script:current; $script:current = '' }
+    }
+    $rows = @(, @((New-Cell 'a long piece of text that must wrap' ''), (New-Cell 'x' 'Green')))
+    Write-Table @('First', 'Second') $rows -MaxWidth 30
+
+    It 'draws every line the same width, within the limit' {
+        ($script:lines | ForEach-Object { $_.Length } | Sort-Object -Unique) -join ',' | Should Be '30'
+    }
+    It 'keeps all the text' {
+        (($script:lines | Where-Object { $_ -like '|*' } | ForEach-Object { ($_ -split '\|')[1].Trim() }) -join ' ') | Should Match 'a long piece of text that must wrap'
+    }
+    It 'handles an unwrapped single row, as a foreach produces' {
+        $script:lines = @()
+        $single = foreach ($n in 'only') { , @((New-Cell $n ''), (New-Cell 'value' '')) }
+        Write-Table @('A', 'B') $single -MaxWidth 30
+        ($script:lines -join ' ') | Should Match '\| only \| value'
+    }
+    It 'handles a single row and a single column' {
+        $script:lines = @()
+        Write-Table @('Only') @(, @(, (New-Cell 'one' ''))) -MaxWidth 30
+        ($script:lines -join ' ') | Should Match '\| one'
+    }
+}
+
+Describe 'Help tables' {
+    It 'shows a command with one example' {
+        (Invoke-Kshrd help setup).Output | Should Match '\| kshrd setup \| Prepare this PC'
+    }
+}

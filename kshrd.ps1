@@ -19,7 +19,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$AppVersion = '1.1.1'
+$AppVersion = '1.1.2'
 $Domain     = 'kshrd.app'
 # Traefik (Docker) owns the wildcard on 80/443. A dedicated loopback address keeps both proxies working.
 $ListenIp   = '127.0.0.2'
@@ -48,9 +48,81 @@ function Write-Done([string]$Message) { Write-Color $Message 'Green' }
 
 function Write-Heading([string]$Text) { Write-Color $Text 'Yellow' }
 
-function Write-Row([string]$Left, [string]$Color, [string]$Right, [int]$Width) {
-    Write-Color ("  {0,-$Width} " -f $Left) $Color -NoNewline
-    Write-Host $Right
+function New-Cell([string]$Text, [string]$Color) {
+    [pscustomobject]@{ Text = $Text; Color = $Color }
+}
+
+function Get-ConsoleWidth {
+    # Piped output is not wrapped, so it stays easy to search.
+    if ([Console]::IsOutputRedirected) { return 10000 }
+    try { [Math]::Max([Console]::WindowWidth, 40) } catch { 120 }
+}
+
+function Split-TextToWidth([string]$Text, [int]$Width) {
+    # Wraps on spaces, and breaks a word only if it is longer than the line.
+    $line = ''
+    foreach ($word in $Text -split ' ') {
+        while ($word.Length -gt $Width) {
+            if ($line) { $line; $line = '' }
+            $word.Substring(0, $Width)
+            $word = $word.Substring($Width)
+        }
+        if (-not $line) { $line = $word }
+        elseif ($line.Length + 1 + $word.Length -le $Width) { $line += " $word" }
+        else { $line; $line = $word }
+    }
+    $line
+}
+
+function Get-ColumnWidths([int[]]$Natural, [int]$MaxWidth) {
+    # Takes from the widest column until the table fits, including '| ' and ' |' borders.
+    $widths = @($Natural)
+    $available = $MaxWidth - (3 * $widths.Count + 1)
+    while (($widths | Measure-Object -Sum).Sum -gt $available) {
+        $widest = [array]::IndexOf($widths, [int]($widths | Measure-Object -Maximum).Maximum)
+        if ($widths[$widest] -le 8) { break }
+        $widths[$widest]--
+    }
+    $widths
+}
+
+function Write-Table([string[]]$Headers, $Rows, [int]$MaxWidth = (Get-ConsoleWidth)) {
+    # Each row is an array of cells from New-Cell.
+    # PowerShell unwraps a one-row result, leaving a bare list of cells.
+    if ($Rows -isnot [array] -or $Rows[0] -isnot [array]) { $Rows = , @($Rows) }
+    $natural = for ($i = 0; $i -lt $Headers.Count; $i++) {
+        $longest = $Headers[$i].Length
+        foreach ($row in $Rows) { $longest = [Math]::Max($longest, $row[$i].Text.Length) }
+        $longest
+    }
+    $widths = @(Get-ColumnWidths $natural $MaxWidth)
+    $border = '+' + (($widths | ForEach-Object { '-' * ($_ + 2) }) -join '+') + '+'
+
+    $writeRow = {
+        param($Cells)
+        $wrapped = [Collections.Generic.List[object]]::new()
+        $height = 0
+        for ($i = 0; $i -lt $Cells.Count; $i++) {
+            $lines = @(Split-TextToWidth $Cells[$i].Text $widths[$i])
+            $wrapped.Add($lines)
+            $height = [Math]::Max($height, $lines.Count)
+        }
+        for ($lineIndex = 0; $lineIndex -lt $height; $lineIndex++) {
+            for ($i = 0; $i -lt $Cells.Count; $i++) {
+                Write-Color '| ' 'DarkGray' -NoNewline
+                $text = if ($lineIndex -lt $wrapped[$i].Count) { $wrapped[$i][$lineIndex] } else { '' }
+                Write-Color $text.PadRight($widths[$i]) $Cells[$i].Color -NoNewline
+                Write-Color ' ' '' -NoNewline
+            }
+            Write-Color '|' 'DarkGray'
+        }
+    }
+
+    Write-Color $border 'DarkGray'
+    & $writeRow @($Headers | ForEach-Object { New-Cell $_ 'Yellow' })
+    Write-Color $border 'DarkGray'
+    foreach ($row in $Rows) { & $writeRow $row }
+    Write-Color $border 'DarkGray'
 }
 
 function Fail([string]$Message) {
@@ -395,14 +467,14 @@ function Show-Status {
     if (Test-NginxRunning) { Write-Color 'running' 'Green' } else { Write-Color 'stopped' 'Red' }
     $sites = Get-Sites
     if (-not $sites.Count) { Write-Host "No sites yet. Run 'kshrd setup'."; return }
-    foreach ($hostname in $sites.Keys) {
+    $rows = foreach ($hostname in $sites.Keys) {
         $appPort = $sites[$hostname]
-        $target, $color = if ($null -eq $appPort) { 'placeholder page', 'DarkGray' }
-                          elseif (Test-Port $appPort) { "localhost:$appPort (up)", 'Green' }
-                          else { "localhost:$appPort (DOWN)", 'Red' }
-        Write-Color ("  https://{0,-30} " -f $hostname) 'Cyan' -NoNewline
-        Write-Color $target $color
+        $target, $state, $color = if ($null -eq $appPort) { 'placeholder page', '-', 'DarkGray' }
+                                  elseif (Test-Port $appPort) { "localhost:$appPort", 'up', 'Green' }
+                                  else { "localhost:$appPort", 'DOWN', 'Red' }
+        , @((New-Cell "https://$hostname" 'Cyan'), (New-Cell $target ''), (New-Cell $state $color))
     }
+    Write-Table @('Site', 'Target', 'App') $rows
 }
 
 function Invoke-Renew {
@@ -535,18 +607,13 @@ function Write-Check([ValidateSet('ok', 'warn', 'fail')][string]$Level, [string]
         'fail' { 'FAIL', 'Red'; $script:DoctorFailures++ }
     }
     if ($Level -eq 'warn') { $script:DoctorWarnings++ }
-    Write-Host '[' -NoNewline
-    Write-Color $label $color -NoNewline
-    Write-Host "] $Message"
-    if ($Fix) {
-        Write-Color '       fix: ' 'DarkGray' -NoNewline
-        Write-Color $Fix 'Cyan'
-    }
+    $script:DoctorRows += , @((New-Cell $label.Trim() $color), (New-Cell $Message ''), (New-Cell $Fix 'Cyan'))
 }
 
 function Invoke-Doctor {
     $script:DoctorFailures = 0
     $script:DoctorWarnings = 0
+    $script:DoctorRows = @()
 
     $toolsOk = $true
     foreach ($tool in 'nginx', 'mkcert') {
@@ -659,6 +726,7 @@ function Invoke-Doctor {
         Write-Check warn 'autostart points at a different copy of kshrd' 'kshrd autostart on'
     }
 
+    Write-Table @('Status', 'Check', 'Fix') $script:DoctorRows
     Write-Host ''
     $color = if ($script:DoctorFailures) { 'Red' } elseif ($script:DoctorWarnings) { 'Yellow' } else { 'Green' }
     Write-Color "$($script:DoctorFailures) problem(s), $($script:DoctorWarnings) warning(s)." $color
@@ -878,7 +946,8 @@ $HelpTopics = [ordered]@{
 
 function Write-Examples($Examples) {
     Write-Heading 'Examples:'
-    foreach ($example in $Examples) { Write-Row $example[0] 'Green' $example[1] 30 }
+    $rows = foreach ($example in $Examples) { , @((New-Cell $example[0] 'Green'), (New-Cell $example[1] '')) }
+    Write-Table @('Command', 'Result') $rows
 }
 
 function Show-Help([string]$Topic) {
@@ -902,14 +971,17 @@ function Show-Help([string]$Topic) {
     Write-Host '  kshrd <command> [arguments]'
     Write-Host ''
     Write-Heading 'Commands:'
-    foreach ($key in $HelpTopics.Keys) {
-        Write-Row $HelpTopics[$key].Usage.Substring(6) 'Cyan' $HelpTopics[$key].Summary 36
+    $rows = foreach ($key in $HelpTopics.Keys) {
+        , @((New-Cell $HelpTopics[$key].Usage.Substring(6) 'Cyan'), (New-Cell $HelpTopics[$key].Summary ''))
     }
+    Write-Table @('Command', 'What it does') $rows
     Write-Host ''
     Write-Heading 'Names:'
-    Write-Row 'demo' 'Cyan' "A subdomain: https://demo.$Domain" 36
-    Write-Row $Domain 'Cyan' 'The main site' 36
-    Write-Row 'shop.test' 'Cyan' 'A custom domain, used exactly as written, with its own certificate' 36
+    Write-Table @('Name', 'Meaning') @(
+        , @((New-Cell 'demo' 'Cyan'), (New-Cell "A subdomain: https://demo.$Domain" ''))
+        , @((New-Cell $Domain 'Cyan'), (New-Cell 'The main site' ''))
+        , @((New-Cell 'shop.test' 'Cyan'), (New-Cell 'A custom domain, used exactly as written, with its own certificate' ''))
+    )
     Write-Host ''
     Write-Examples @(
         @('kshrd setup', 'First run on this PC'),
