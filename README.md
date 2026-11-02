@@ -15,10 +15,15 @@ kshrd setup                 First run: trust the CA, issue the certificate, upda
 kshrd add demo 3000         https://demo.kshrd.app -> localhost:3000
 kshrd add kshrd.app 3000    https://kshrd.app -> localhost:3000
 kshrd add shop.test 3000    https://shop.test -> localhost:3000 (any full domain name)
-kshrd remove demo           Remove a site
+kshrd add shop.test /api 5000       https://shop.test/api -> localhost:5000
+kshrd add docs.test ./dist          https://docs.test -> the dist folder
+kshrd add db.test 192.168.1.5:8080  https://db.test -> another machine
+kshrd add a.test:3000 b.test:4000   Add several sites with one admin prompt
+kshrd up                    Add the sites listed in this folder's kshrd.json (kshrd down removes them)
+kshrd remove demo           Remove a site (kshrd remove shop.test /api removes one route)
 kshrd open shop.test        Open a site in the browser
-kshrd logs shop.test        Show its recent requests and errors (-f to keep watching, -Errors for errors only)
-kshrd status                Show nginx, each site, and whether its app is up
+kshrd logs shop.test        Show its recent requests and errors (-f to keep watching, -Errors for errors only, -Clear to empty them)
+kshrd status                Show nginx, each site, and whether its app is up (kshrd list seyha filters, -Json for scripts)
 kshrd doctor                Check for problems and suggest a fix for each
 kshrd renew                 Reissue certificates that expire soon (-Force for all of them)
 kshrd autostart on          Start nginx when you log in (off, status)
@@ -36,9 +41,19 @@ Output is coloured in a terminal. Set the `NO_COLOR` environment variable to tur
 
 Changing the hosts file shows a Windows admin prompt. Nothing else needs admin rights.
 
+`kshrd add` asks first if the name is a real website or nothing responds at the target. Add `-Yes` to skip the questions.
+
+A route such as `/api` keeps its path when it calls the app, so `/api/users` arrives as `/api/users`.
+
+A project can list its sites in a `kshrd.json`, with folders relative to that file:
+
+```json
+{ "sites": { "shop.test": 3000, "shop.test/api": 5000, "docs.test": "./dist" } }
+```
+
 A name containing a dot is used as the full domain. It gets its own certificate in `certs/`, which `kshrd remove` deletes and `kshrd setup` reissues if it is missing. Add `www.shop.test` separately if you want it too.
 
-`sites.json` lists the sites. Use `kshrd add` and `kshrd remove` instead of editing it, because they also regenerate the nginx config and hosts entries.
+`sites.json` lists your sites and isn't committed, because it's personal to this PC. `sites.example.json` shows the format. Use `kshrd add` and `kshrd remove` instead of editing it, because they also regenerate the nginx config and hosts entries.
 
 ## Known limits
 
@@ -49,6 +64,9 @@ A name containing a dot is used as the full domain. It gets its own certificate 
 - **App config:** OAuth callbacks and CORS allow-lists must use the new URLs.
 - **Other browsers and tools:** Chrome and Edge use the Windows trust store. Node and Java tools don't. For Node, set `NODE_EXTRA_CA_CERTS` to the `rootCA.pem` in the folder shown by `mkcert -CAROOT`.
 - **CA key:** `rootCA-key.pem` in that same folder can issue certificates this PC trusts for any site. Never share it.
+
+- **Other machines:** nginx looks up a `host:port` target's name when it starts, and won't start if the lookup fails. Use an IP address if the name isn't always available.
+- **Static folders:** there is no fallback to `index.html`, so a single-page app's deep links return 404.
 
 ## Troubleshooting
 

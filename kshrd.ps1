@@ -7,11 +7,15 @@
 param(
     [Parameter(Position = 0)][string]$Command = 'help',
     [Parameter(Position = 1)][string]$Name,
-    [Parameter(Position = 2)][int]$Port,
+    [Parameter(Position = 2)][string]$Target,
+    [Parameter(Position = 3, ValueFromRemainingArguments)][string[]]$Rest,
     [switch]$RemoveCA,
     [switch]$ClearHosts,
     [switch]$Force,
     [Alias('f')][switch]$Follow,
+    [Alias('y')][switch]$Yes,
+    [switch]$Json,
+    [switch]$Clear,
     [switch]$Errors,
     [Alias('h')][switch]$Help,
     [Alias('v')][switch]$Version
@@ -19,7 +23,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$AppVersion = '1.1.2'
+# Unset, this would count as one empty argument.
+$Rest = @($Rest | Where-Object { $_ })
+
+$AppVersion = '1.2.0'
 $Domain     = 'kshrd.app'
 # Traefik (Docker) owns the wildcard on 80/443. A dedicated loopback address keeps both proxies working.
 $ListenIp   = '127.0.0.2'
@@ -36,6 +43,10 @@ $BlockEnd   = "# END $Domain"
 $RenewDays  = 30
 $RunKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $LogDir     = Join-Path $Root 'nginx\logs'
+$ProjectFile = 'kshrd.json'
+$LogWarnBytes = 100MB
+# Endings that are not public, so a name using one can't hide a real website.
+$PrivateEndings = 'test', 'example', 'invalid', 'local', 'localdomain', 'internal', 'intranet', 'lan', 'home', 'corp'
 
 function Write-Color([string]$Text, [string]$Color, [switch]$NoNewline) {
     # https://no-color.org: any non-empty NO_COLOR turns colour off.
@@ -182,6 +193,110 @@ function Resolve-Hostname([string]$Value) {
     "$value.$Domain"
 }
 
+function ConvertTo-RoutePath([string]$Path) {
+    if ($Path -notmatch '^/[A-Za-z0-9._~/-]*$' -or $Path -match '(^|/)\.\.(/|$)') {
+        Fail "'$Path' is not a valid path. Use something like /api."
+    }
+    $trimmed = $Path.TrimEnd('/')
+    if ($trimmed) { $trimmed } else { '/' }
+}
+
+function ConvertTo-StoredTarget([string]$Text, [string]$BaseDir) {
+    # Turns what the user typed into what sites.json stores:
+    # a number for a local port, 'host:port' for another machine, 'dir:<path>' for a folder.
+    $text = $Text.Trim()
+    if (-not $text) { Fail 'a port, host:port or folder is required.' }
+    if ($text -match '^\d+$' -or $text -match '^localhost:(\d+)$') {
+        $number = [long]$(if ($Matches[1]) { $Matches[1] } else { $text })
+        if ($number -lt 1 -or $number -gt 65535) { Fail "port $number is not between 1 and 65535." }
+        if ($number -in 80, 443) { Fail "port $number is used by nginx itself." }
+        return [int]$number
+    }
+    if ($text -match '^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):(\d+)$') {
+        if ([long]$Matches[2] -lt 1 -or [long]$Matches[2] -gt 65535) { Fail "'$text' has a port that is not between 1 and 65535." }
+        return $text
+    }
+    $full = [IO.Path]::GetFullPath($text, $BaseDir)
+    if (-not (Test-Path $full -PathType Container)) { Fail "'$text' is not a port, a host:port or an existing folder." }
+    # These would be read as nginx syntax.
+    if ($full -match '["$;{}]') { Fail "the folder '$full' contains a character nginx can't use." }
+    'dir:' + $full.Replace('\', '/').TrimEnd('/')
+}
+
+function Get-TargetKind($Stored) {
+    if ("$Stored" -match '^\d+$') { 'port' } elseif ("$Stored".StartsWith('dir:')) { 'dir' } else { 'remote' }
+}
+
+function Get-TargetText($Stored) {
+    switch (Get-TargetKind $Stored) {
+        'port' { "localhost:$Stored" }
+        'dir' { "$Stored".Substring(4) }
+        default { "$Stored" }
+    }
+}
+
+function Get-Routes($Value) {
+    # Every site value as path -> stored target: nothing, a single target, or several routes.
+    $routes = [ordered]@{}
+    if ($null -eq $Value) { return , $routes }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) { $routes[[string]$key] = $Value[$key] }
+    } elseif ($Value -is [pscustomobject]) {
+        foreach ($p in $Value.PSObject.Properties) { $routes[$p.Name] = $p.Value }
+    } else {
+        $routes['/'] = $Value
+    }
+    , $routes
+}
+
+function Compress-Routes($Routes) {
+    # Keeps sites.json simple: a site with only a root route stays a plain value.
+    if ($Routes.Count -eq 0) { return $null }
+    if ($Routes.Count -eq 1 -and $Routes.Contains('/')) { return $Routes['/'] }
+    , $Routes
+}
+
+function Test-Remote([string]$Address) {
+    $at = $Address.LastIndexOf(':')
+    $client = [Net.Sockets.TcpClient]::new()
+    try {
+        $client.ConnectAsync($Address.Substring(0, $at).Trim('[', ']'), [int]$Address.Substring($at + 1)).Wait(1000)
+    } catch {
+        $false
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Test-Target($Stored) {
+    switch (Get-TargetKind $Stored) {
+        'port' { Test-Port ([int]$Stored) }
+        'dir' { Test-Path "$Stored".Substring(4) -PathType Container }
+        default { Test-Remote "$Stored" }
+    }
+}
+
+function Test-RealDomain([string]$Hostname) {
+    # Asks DNS, not the hosts file. An offline PC just gets no warning.
+    if (-not (Test-OwnCert $Hostname)) { return $false }
+    if ($Hostname.Substring($Hostname.LastIndexOf('.') + 1) -in $PrivateEndings) { return $false }
+    try {
+        [bool](Resolve-DnsName $Hostname -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -in 'A', 'AAAA' })
+    } catch {
+        $false
+    }
+}
+
+function Confirm-Action([string]$Message) {
+    # With no one to ask, as in a script, warn and carry on.
+    if ($Yes -or [Console]::IsInputRedirected) {
+        Write-Warning $Message
+        return $true
+    }
+    Write-Color $Message 'Yellow'
+    (Read-Host 'Continue? [Y/n]') -notmatch '^\s*n'
+}
+
 function Test-OwnCert([string]$Hostname) {
     # The shared certificate covers $Domain and one label below it. Anything else gets its own.
     $Hostname -notmatch "^([^.]+\.)?$([regex]::Escape($Domain))$"
@@ -255,7 +370,27 @@ function New-OwnCerts($Sites) {
     }
 }
 
-function New-SiteConfig([string]$Hostname, $AppPort) {
+function New-ProxyLocation([string]$Match, [string]$Upstream, [string]$Label, [string]$ConnectTimeout) {
+    @"
+    location $Match {
+        set `$app_port "$Label";
+        proxy_pass http://$Upstream;
+        proxy_connect_timeout $ConnectTimeout;
+        proxy_http_version 1.1;
+        proxy_set_header Host `$host;
+        proxy_set_header X-Real-IP `$remote_addr;
+        proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto `$scheme;
+        proxy_set_header X-Forwarded-Host `$host;
+        proxy_set_header Upgrade `$http_upgrade;
+        proxy_set_header Connection `$connection_upgrade;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+"@
+}
+
+function New-SiteConfig([string]$Hostname, $Value) {
     $tls = @"
     listen ${ListenIp}:443 ssl;
     http2 on;
@@ -270,7 +405,8 @@ function New-SiteConfig([string]$Hostname, $AppPort) {
     ssl_certificate_key ../../certs/$Hostname-key.pem;
 "@
     }
-    if ($null -eq $AppPort) {
+    $routes = Get-Routes $Value
+    if ($routes.Count -eq 0) {
         return @"
 server {
 $tls
@@ -282,43 +418,61 @@ $tls
 }
 "@
     }
-    # Apps may bind to either loopback family. Windows takes 2s to refuse a closed
-    # loopback port, so fail over on a short connect timeout, and keep fail_timeout
-    # short so a restarted app is reachable again almost immediately.
-    @"
-upstream $Hostname.upstream {
-    server 127.0.0.1:$AppPort max_fails=1 fail_timeout=1s;
-    server [::1]:$AppPort max_fails=0 backup;
-}
 
-server {
-$tls
-
-    set `$app_port $AppPort;
-
-    location / {
-        proxy_pass http://$Hostname.upstream;
-        proxy_connect_timeout 250ms;
-        proxy_http_version 1.1;
-        proxy_set_header Host `$host;
-        proxy_set_header X-Real-IP `$remote_addr;
-        proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto `$scheme;
-        proxy_set_header X-Forwarded-Host `$host;
-        proxy_set_header Upgrade `$http_upgrade;
-        proxy_set_header Connection `$connection_upgrade;
-        proxy_read_timeout 1h;
-        proxy_send_timeout 1h;
+    $upstreams = @()
+    $locations = @()
+    $proxied = $false
+    $index = 0
+    foreach ($path in $routes.Keys) {
+        $stored = $routes[$path]
+        $kind = Get-TargetKind $stored
+        if ($kind -eq 'dir') {
+            $folder = "$stored".Substring(4)
+            if ($path -eq '/') {
+                $locations += "    location / {`n        root `"$folder`";`n        index index.html;`n    }"
+            } else {
+                $locations += "    location = $path {`n        return 301 $path/;`n    }"
+                $locations += "    location $path/ {`n        alias `"$folder/`";`n        index index.html;`n    }"
+            }
+            continue
+        }
+        $proxied = $true
+        $upstream = if ($index) { "$Hostname.upstream$index" } else { "$Hostname.upstream" }
+        $index++
+        if ($kind -eq 'port') {
+            # Apps may bind to either loopback family. Windows takes 2s to refuse a closed
+            # loopback port, so fail over on a short connect timeout, and keep fail_timeout
+            # short so a restarted app is reachable again almost immediately.
+            $upstreams += "upstream $upstream {`n    server 127.0.0.1:$stored max_fails=1 fail_timeout=1s;`n    server [::1]:$stored max_fails=0 backup;`n}"
+            $label = "$stored"
+            $timeout = '250ms'
+        } else {
+            $upstreams += "upstream $upstream {`n    server $stored max_fails=1 fail_timeout=1s;`n}"
+            $label = "$stored"
+            $timeout = '3s'
+        }
+        if ($path -eq '/') {
+            $locations += New-ProxyLocation '/' $upstream $label $timeout
+        } else {
+            # Both forms, because a redirect from /api to /api/ would lose a POST body.
+            $locations += New-ProxyLocation "= $path" $upstream $label $timeout
+            $locations += New-ProxyLocation "$path/" $upstream $label $timeout
+        }
     }
-
+    # Without this, nginx would answer other paths from its own html folder.
+    if (-not $routes.Contains('/')) { $locations += "    location / {`n        return 404;`n    }" }
+    if ($proxied) {
+        $locations += @"
     error_page 502 504 /__kshrd_502.html;
     location = /__kshrd_502.html {
         internal;
         alias html/502.html;
         ssi on;
     }
-}
 "@
+    }
+    $head = if ($upstreams) { ($upstreams -join "`n`n") + "`n`n" } else { '' }
+    "${head}server {`n$tls`n`n$($locations -join "`n`n")`n}"
 }
 
 function Write-SiteConfigs($Sites) {
@@ -462,19 +616,48 @@ function Test-Port([int]$AppPort) {
     $false
 }
 
-function Show-Status {
-    Write-Host 'nginx: ' -NoNewline
-    if (Test-NginxRunning) { Write-Color 'running' 'Green' } else { Write-Color 'stopped' 'Red' }
+function Get-StatusRows([string]$Filter) {
     $sites = Get-Sites
-    if (-not $sites.Count) { Write-Host "No sites yet. Run 'kshrd setup'."; return }
-    $rows = foreach ($hostname in $sites.Keys) {
-        $appPort = $sites[$hostname]
-        $target, $state, $color = if ($null -eq $appPort) { 'placeholder page', '-', 'DarkGray' }
-                                  elseif (Test-Port $appPort) { "localhost:$appPort", 'up', 'Green' }
-                                  else { "localhost:$appPort", 'DOWN', 'Red' }
-        , @((New-Cell "https://$hostname" 'Cyan'), (New-Cell $target ''), (New-Cell $state $color))
+    foreach ($hostname in $sites.Keys) {
+        $routes = Get-Routes $sites[$hostname]
+        if ($routes.Count -eq 0) {
+            $rows = @([pscustomobject]@{ url = "https://$hostname"; kind = 'placeholder'; target = 'placeholder page'; up = $null })
+        } else {
+            $rows = foreach ($path in $routes.Keys) {
+                $stored = $routes[$path]
+                [pscustomobject]@{
+                    url    = "https://$hostname$(if ($path -ne '/') { $path })"
+                    kind   = Get-TargetKind $stored
+                    target = Get-TargetText $stored
+                    up     = [bool](Test-Target $stored)
+                }
+            }
+        }
+        $rows | Where-Object { -not $Filter -or $_.url.Contains($Filter.ToLowerInvariant()) }
     }
-    Write-Table @('Site', 'Target', 'App') $rows
+}
+
+function Show-Status {
+    $running = Test-NginxRunning
+    $rows = @(Get-StatusRows $Name)
+    if ($Json) {
+        [pscustomobject]@{ version = $AppVersion; nginx = $(if ($running) { 'running' } else { 'stopped' }); sites = $rows } | ConvertTo-Json -Depth 4
+        return
+    }
+    Write-Host 'nginx: ' -NoNewline
+    if ($running) { Write-Color 'running' 'Green' } else { Write-Color 'stopped' 'Red' }
+    if (-not $rows) {
+        if ($Name) { Write-Host "No sites match '$Name'." } else { Write-Host "No sites yet. Run 'kshrd setup'." }
+        return
+    }
+    $cells = foreach ($row in $rows) {
+        $state, $color = if ($null -eq $row.up) { '-', 'DarkGray' }
+                         elseif ($row.up) { 'up', 'Green' }
+                         elseif ($row.kind -eq 'dir') { 'MISSING', 'Red' }
+                         else { 'DOWN', 'Red' }
+        , @((New-Cell $row.url 'Cyan'), (New-Cell $row.target ''), (New-Cell $state $color))
+    }
+    Write-Table @('Site', 'Target', 'App') $cells
 }
 
 function Invoke-Renew {
@@ -515,6 +698,16 @@ function Invoke-Logs {
     $hostname = Get-RegisteredHostname
     $access = Join-Path $LogDir "$hostname.access.log"
     $errorLog = Join-Path $LogDir "$hostname.error.log"
+    if ($Clear) {
+        foreach ($path in $access, $errorLog) {
+            if (-not (Test-Path $path)) { continue }
+            # nginx keeps these open, so empty them rather than delete them.
+            $stream = [IO.FileStream]::new($path, 'Open', 'Write', [IO.FileShare]'ReadWrite, Delete')
+            try { $stream.SetLength(0) } finally { $stream.Dispose() }
+        }
+        Write-Done "Cleared the logs for $hostname."
+        return
+    }
     if ($Follow) {
         $path = if ($Errors) { $errorLog } else { $access }
         if (-not (Test-Path $path)) { Fail "no log for $hostname yet. If nginx has been running since before this update, run 'kshrd restart'." }
@@ -713,11 +906,27 @@ function Invoke-Doctor {
                 continue
             }
         }
-        $appPort = $sites[$hostname]
-        if ($null -ne $appPort -and -not (Test-Port $appPort)) {
-            Write-Check warn "$hostname has no app on port $appPort" "start the app, or change the port with: kshrd add $hostname <port>"
-        } elseif ($addresses) {
+        $routes = Get-Routes $sites[$hostname]
+        $broken = @($routes.Keys | Where-Object { -not (Test-Target $routes[$_]) })
+        foreach ($path in $broken) {
+            $shown = "$hostname$(if ($path -ne '/') { $path })"
+            $where = Get-TargetText $routes[$path]
+            if ((Get-TargetKind $routes[$path]) -eq 'dir') {
+                Write-Check warn "$shown serves a missing folder: $where" "create the folder, or change it with: kshrd add $hostname $(if ($path -ne '/') { "$path " })<target>"
+            } else {
+                Write-Check warn "$shown has nothing responding at $where" "start the app, or change it with: kshrd add $hostname $(if ($path -ne '/') { "$path " })<target>"
+            }
+        }
+        if (-not $broken -and $addresses) {
             Write-Check ok "$hostname is working$(if (-not $running) { ' (HTTPS not checked: nginx is stopped)' })"
+        }
+    }
+
+    foreach ($log in Get-ChildItem $LogDir -Filter '*.log' -ErrorAction SilentlyContinue) {
+        if ($log.Length -gt $LogWarnBytes) {
+            $site = $log.Name -replace '\.(access|error)\.log$', ''
+            $fix = if ($site -eq $log.Name) { "stop nginx, then delete $($log.Name)" } else { "kshrd logs $site -Clear" }
+            Write-Check warn ("{0} is {1:N0} MB" -f $log.Name, ($log.Length / 1MB)) $fix
         }
     }
 
@@ -771,42 +980,160 @@ function Set-Sites($Sites) {
     Update-Nginx
 }
 
-function Invoke-Add {
-    if ($Port -lt 1 -or $Port -gt 65535) { Fail 'usage: kshrd add <name> <port>' }
-    if ($Port -in 80, 443) { Fail "port $Port is used by nginx itself." }
-    if (-not (Test-Path (Join-Path $CertDir "$Domain.pem"))) { Fail "run 'kshrd setup' first." }
-    $hostname = Resolve-Hostname $Name
-    $sites = Get-Sites
-    $sites[$hostname] = $Port
-    New-OwnCerts $sites
-    Set-Sites $sites
-    Write-Color "https://$hostname" 'Cyan' -NoNewline
-    Write-Host " -> localhost:$Port"
-    if (Test-OwnCert $hostname) {
-        Write-Host "Note: if $hostname is a real site on the internet, this PC can't reach it until you remove this entry."
+function Split-SiteSpec([string]$Spec) {
+    # 'seyha.com/api' -> host seyha.com, path /api
+    $slash = $Spec.IndexOf('/')
+    if ($slash -lt 0) { return [pscustomobject]@{ Hostname = Resolve-Hostname $Spec; Path = $null } }
+    [pscustomobject]@{
+        Hostname = Resolve-Hostname $Spec.Substring(0, $slash)
+        Path     = ConvertTo-RoutePath $Spec.Substring($slash)
     }
-    if (-not (Test-Port $Port)) { Write-Warning "nothing is listening on port $Port yet." }
 }
 
-function Invoke-Remove {
-    $hostname = Resolve-Hostname $Name
-    $sites = Get-Sites
-    if (-not $sites.Contains($hostname)) { Fail "$hostname is not registered." }
-    if ($hostname -eq $Domain) {
-        # The bare domain stays registered and falls back to the placeholder page.
-        $sites[$Domain] = $null
+function New-AddItem([string]$Spec, [string]$RoutePath, [string]$TargetText, [string]$BaseDir) {
+    $site = Split-SiteSpec $Spec
+    $path = if ($RoutePath) { ConvertTo-RoutePath $RoutePath } elseif ($site.Path) { $site.Path } else { '/' }
+    [pscustomobject]@{ Hostname = $site.Hostname; Path = $path; Stored = ConvertTo-StoredTarget $TargetText $BaseDir }
+}
+
+function Get-AddItems {
+    $usage = 'usage: kshrd add <name> <target>, kshrd add <name> /path <target>, or kshrd add <name>:<target> <name>:<target> ...'
+    if (-not $Name) { Fail $usage }
+    $base = (Get-Location).Path
+    if ($Name.Contains(':')) {
+        foreach ($spec in @($Name, $Target) + @($Rest) | Where-Object { $_ }) {
+            $parts = $spec -split ':', 2
+            if ($parts.Count -ne 2) { Fail "'$spec' needs a target, as in name:3000. $usage" }
+            New-AddItem $parts[0] '' $parts[1] $base
+        }
+    } elseif ($Target -and $Target.StartsWith('/') -and @($Rest).Count -eq 1) {
+        New-AddItem $Name $Target $Rest[0] $base
+    } elseif ($Target -and -not @($Rest).Count) {
+        New-AddItem $Name '' $Target $base
     } else {
-        $sites.Remove($hostname)
+        Fail $usage
     }
+}
+
+function Add-Items($Items, [switch]$NoPrompt) {
+    if (-not (Test-Path (Join-Path $CertDir "$Domain.pem"))) { Fail "run 'kshrd setup' first." }
+    $sites = Get-Sites
+    if (-not $NoPrompt) {
+        $checked = @()
+        foreach ($item in $Items) {
+            if (-not $sites.Contains($item.Hostname) -and $item.Hostname -notin $checked) {
+                $checked += $item.Hostname
+                if ((Test-RealDomain $item.Hostname) -and -not (Confirm-Action "$($item.Hostname) is a real site on the internet. This PC can't reach the real one while this entry exists.")) {
+                    Fail 'cancelled; nothing was changed.'
+                }
+            }
+            # Repeating a mapping that already exists doesn't need asking about again.
+            $existing = (Get-Routes $sites[$item.Hostname])[$item.Path]
+            if ("$existing" -ne "$($item.Stored)" -and -not (Test-Target $item.Stored)) {
+                if (-not (Confirm-Action "Nothing is responding at $(Get-TargetText $item.Stored). Check it isn't a typo.")) {
+                    Fail 'cancelled; nothing was changed.'
+                }
+            }
+        }
+    }
+    foreach ($item in $Items) {
+        $routes = Get-Routes $sites[$item.Hostname]
+        $routes[$item.Path] = $item.Stored
+        $sites[$item.Hostname] = Compress-Routes $routes
+    }
+    New-OwnCerts $sites
     Set-Sites $sites
-    if (Test-OwnCert $hostname) {
-        Remove-Item (Join-Path $CertDir "$hostname.pem"), (Join-Path $CertDir "$hostname-key.pem") -Force -ErrorAction SilentlyContinue
+    foreach ($item in $Items) {
+        Write-Color "https://$($item.Hostname)$(if ($item.Path -ne '/') { $item.Path })" 'Cyan' -NoNewline
+        Write-Host " -> $(Get-TargetText $item.Stored)"
     }
-    if ($hostname -ne $Domain) {
+}
+
+function Invoke-Add {
+    Add-Items @(Get-AddItems)
+}
+
+function Remove-Items($Items, [switch]$IgnoreMissing) {
+    $sites = Get-Sites
+    $gone = @()
+    $done = @()
+    foreach ($item in $Items) {
+        $hostname = $item.Hostname
+        if (-not $sites.Contains($hostname)) {
+            if ($IgnoreMissing) { continue }
+            Fail "$hostname is not registered."
+        }
+        $routes = Get-Routes $sites[$hostname]
+        if ($item.Path) {
+            if (-not $routes.Contains($item.Path)) {
+                if ($IgnoreMissing) { continue }
+                Fail "$hostname has no route for $($item.Path)."
+            }
+            $routes.Remove($item.Path)
+            $done += "$hostname$($item.Path)"
+        } else {
+            $routes.Clear()
+            $done += $hostname
+        }
+        if ($routes.Count) {
+            $sites[$hostname] = Compress-Routes $routes
+        } elseif ($hostname -eq $Domain) {
+            # The bare domain stays registered and falls back to the placeholder page.
+            $sites[$Domain] = $null
+        } else {
+            $sites.Remove($hostname)
+            $gone += $hostname
+        }
+    }
+    if (-not $done) { Write-Host 'Nothing to remove.'; return }
+    Set-Sites $sites
+    foreach ($hostname in $gone) {
+        if (Test-OwnCert $hostname) {
+            Remove-Item (Join-Path $CertDir "$hostname.pem"), (Join-Path $CertDir "$hostname-key.pem") -Force -ErrorAction SilentlyContinue
+        }
         # A worker that is still finishing may hold these open, so this is best effort.
         Remove-Item (Join-Path $LogDir "$hostname.access.log"), (Join-Path $LogDir "$hostname.error.log") -Force -ErrorAction SilentlyContinue
     }
-    Write-Done "Removed $hostname."
+    foreach ($entry in $done) { Write-Done "Removed $entry." }
+}
+
+function Invoke-Remove {
+    if (-not $Name) { Fail 'usage: kshrd remove <name> [/path], or kshrd remove <name> <name> ...' }
+    if ($Target -and $Target.StartsWith('/')) {
+        if (@($Rest).Count) { Fail 'usage: kshrd remove <name> /path' }
+        Remove-Items @([pscustomobject]@{ Hostname = Resolve-Hostname $Name; Path = ConvertTo-RoutePath $Target })
+        return
+    }
+    $items = foreach ($spec in @($Name, $Target) + @($Rest) | Where-Object { $_ }) { Split-SiteSpec $spec }
+    Remove-Items @($items)
+}
+
+function Read-ProjectItems {
+    # kshrd.json: { "sites": { "shop.test": 3000, "shop.test/api": 5000, "docs.test": "./dist" } }
+    $base = (Get-Location).Path
+    $path = Join-Path $base $ProjectFile
+    if (-not (Test-Path $path)) { Fail "no $ProjectFile in $base. See 'kshrd help up'." }
+    try {
+        $project = Get-Content $path -Raw | ConvertFrom-Json
+    } catch {
+        Fail "$ProjectFile is not valid JSON: $($_.Exception.Message)"
+    }
+    $entries = @($project.sites.PSObject.Properties)
+    if (-not $entries) { Fail "$ProjectFile has no sites. It needs: { `"sites`": { `"shop.test`": 3000 } }" }
+    foreach ($entry in $entries) {
+        New-AddItem $entry.Name '' "$($entry.Value)" $base
+    }
+}
+
+function Invoke-Up {
+    # A project file is written on purpose, and its apps usually start afterwards, so no questions.
+    $items = @(Read-ProjectItems)
+    Add-Items $items -NoPrompt
+}
+
+function Invoke-Down {
+    $items = @(Read-ProjectItems)
+    Remove-Items $items -IgnoreMissing
 }
 
 function Invoke-Teardown {
@@ -827,22 +1154,40 @@ $HelpTopics = [ordered]@{
         Examples = @(, @('kshrd setup', 'Prepare this PC'))
     }
     add      = @{
-        Usage    = 'kshrd add <name> <port>'
-        Summary  = 'Point a subdomain or custom domain at an app on localhost, or change its port'
-        Details  = "<name> is a subdomain, $Domain for the main site, or a full custom domain, which gets its own certificate. Prefer the reserved .test ending for made-up names, because a real site with the same name can't be reached from this PC while the entry exists. <port> is 1-65535, except 80 and 443."
+        Usage    = 'kshrd add <name> [/path] <target>'
+        Summary  = 'Point a site or path at an app, machine or folder, or change it'
+        Details  = "<name> is a subdomain, $Domain for the main site, or a full custom domain, which gets its own certificate. <target> is a local port, a host:port on another machine, or a folder to serve. A /path route keeps the path when it calls the app, so /api/users arrives as /api/users. Several name:target pairs can be added at once with one admin prompt. kshrd asks first if the name is a real website or nothing responds at the target; -Yes skips the question. Prefer the reserved .test ending for made-up names."
         Examples = @(
             @('kshrd add shop.test 3000', 'https://shop.test -> localhost:3000'),
             @('kshrd add demo 3000', "https://demo.$Domain -> localhost:3000"),
-            @("kshrd add $Domain 3000", "https://$Domain -> localhost:3000")
+            @("kshrd add $Domain 3000", "https://$Domain -> localhost:3000"),
+            @('kshrd add shop.test /api 5000', 'https://shop.test/api -> localhost:5000'),
+            @('kshrd add docs.test ./dist', 'https://docs.test -> the dist folder'),
+            @('kshrd add db.test 192.168.1.5:8080', 'https://db.test -> another machine'),
+            @('kshrd add a.test:3000 api.a.test:5000', 'Add both with one admin prompt')
         )
     }
+    up       = @{
+        Usage    = 'kshrd up'
+        Summary  = "Add every site listed in this folder's kshrd.json"
+        Details  = 'kshrd.json looks like { "sites": { "shop.test": 3000, "shop.test/api": 5000, "docs.test": "./dist" } }. Folders are relative to it. Run it again after editing the file. Removing a line does not remove the site, so run kshrd down before you remove one.'
+        Examples = @(, @('kshrd up', 'Add this project''s sites'))
+    }
+    down     = @{
+        Usage    = 'kshrd down'
+        Summary  = "Remove every site listed in this folder's kshrd.json"
+        Details  = 'Only removes what the file lists. Other routes on the same site stay.'
+        Examples = @(, @('kshrd down', 'Remove this project''s sites'))
+    }
     remove   = @{
-        Usage    = 'kshrd remove <name>'
-        Summary  = 'Remove a site'
+        Usage    = 'kshrd remove <name> [/path]'
+        Summary  = 'Remove a site, several sites, or one path'
         Details  = "A custom domain's certificate is deleted too. Removing $Domain keeps it registered and brings back the placeholder page."
         Examples = @(
             @('kshrd remove shop.test', 'Stop serving https://shop.test'),
-            @('kshrd remove demo', "Stop serving https://demo.$Domain")
+            @('kshrd remove demo', "Stop serving https://demo.$Domain"),
+            @('kshrd remove shop.test /api', 'Remove only the /api route'),
+            @('kshrd remove a.test b.test', 'Remove both with one admin prompt')
         )
     }
     open     = @{
@@ -855,23 +1200,28 @@ $HelpTopics = [ordered]@{
         )
     }
     logs     = @{
-        Usage    = 'kshrd logs <name> [-Follow] [-Errors]'
+        Usage    = 'kshrd logs <name> [-Follow] [-Errors] [-Clear]'
         Summary  = 'Show the recent requests and errors for one site'
-        Details  = 'Shows the last 30 lines of each log. -Follow (or -f) keeps watching the requests until you press Ctrl+C. -Errors shows only the errors, and can be combined with -Follow.'
+        Details  = 'Shows the last 30 lines of each log. -Follow (or -f) keeps watching the requests until you press Ctrl+C. -Errors shows only the errors, and can be combined with -Follow. -Clear empties both logs.'
         Examples = @(
             @('kshrd logs shop.test', 'Show recent requests and errors'),
             @('kshrd logs shop.test -f', 'Watch requests as they arrive'),
-            @('kshrd logs shop.test -Errors', 'Show only the errors')
+            @('kshrd logs shop.test -Errors', 'Show only the errors'),
+            @('kshrd logs shop.test -Clear', 'Empty the logs')
         )
     }
     list     = @{
-        Usage    = 'kshrd list'
+        Usage    = 'kshrd list [filter] [-Json]'
         Summary  = 'Show nginx, each site, and whether its app is up'
-        Details  = 'Same as kshrd status.'
-        Examples = @(, @('kshrd list', 'Show all sites'))
+        Details  = 'Same as kshrd status. [filter] keeps sites whose URL contains that text. -Json prints the result for other scripts.'
+        Examples = @(
+            @('kshrd list', 'Show all sites'),
+            @('kshrd list seyha', 'Show only matching sites'),
+            @('kshrd list -Json', 'Print as JSON')
+        )
     }
     status   = @{
-        Usage    = 'kshrd status'
+        Usage    = 'kshrd status [filter] [-Json]'
         Summary  = 'Same as kshrd list'
         Details  = 'Same as kshrd list.'
         Examples = @(, @('kshrd status', 'Show all sites'))
@@ -987,7 +1337,10 @@ function Show-Help([string]$Topic) {
         @('kshrd setup', 'First run on this PC'),
         @('kshrd add shop.test 3000', 'https://shop.test -> localhost:3000'),
         @('kshrd add demo 3000', "https://demo.$Domain -> localhost:3000"),
-        @("kshrd add $Domain 3000", "https://$Domain -> localhost:3000"),
+        @('kshrd add shop.test /api 5000', 'https://shop.test/api -> localhost:5000'),
+        @('kshrd add docs.test ./dist', 'https://docs.test -> the dist folder'),
+        @('kshrd add a.test:3000 b.test:4000', 'Add both with one admin prompt'),
+        @('kshrd up', "Add the sites in this folder's kshrd.json"),
         @('kshrd open shop.test', 'Open it in the browser'),
         @('kshrd logs shop.test -f', 'Watch its requests'),
         @('kshrd list', 'Check nginx and each site'),
@@ -1018,6 +1371,8 @@ if ($Help -or $Command -in $HelpFlags -or $Name -in $HelpFlags) {
 switch ($Command.ToLowerInvariant()) {
     'setup'        { Invoke-Setup }
     'add'          { Invoke-Add }
+    'up'           { Invoke-Up }
+    'down'         { Invoke-Down }
     'remove'       { Invoke-Remove }
     'list'         { Show-Status }
     'status'       { Show-Status }

@@ -286,3 +286,140 @@ Describe 'Help tables' {
         (Invoke-Kshrd help setup).Output | Should Match '\| kshrd setup \| Prepare this PC'
     }
 }
+
+Describe 'ConvertTo-StoredTarget' {
+    It 'stores a port as a number' { ConvertTo-StoredTarget '3000' $TestDrive | Should Be 3000 }
+    It 'treats localhost:port as a port' { ConvertTo-StoredTarget 'localhost:3000' $TestDrive | Should Be 3000 }
+    It 'keeps another machine as host:port' { ConvertTo-StoredTarget '192.168.1.5:8080' $TestDrive | Should Be '192.168.1.5:8080' }
+    It 'accepts a bracketed IPv6 address' { ConvertTo-StoredTarget '[fd00::1]:8080' $TestDrive | Should Be '[fd00::1]:8080' }
+    It 'resolves a relative folder' {
+        New-Item -ItemType Directory (Join-Path $TestDrive 'dist') | Out-Null
+        ConvertTo-StoredTarget './dist' $TestDrive | Should Match '^dir:.*/dist$'
+    }
+}
+
+Describe 'Invalid targets and routes' {
+    # All of these fail before anything changes.
+    It 'rejects a port out of range' { (Invoke-Kshrd add x.test 99999).Output | Should Match 'between 1 and 65535' }
+    It 'rejects nginx''s own port' { (Invoke-Kshrd add x.test 443).Output | Should Match 'used by nginx' }
+    It 'rejects a missing folder' { (Invoke-Kshrd add x.test ./no-such-folder).Output | Should Match 'existing folder' }
+    It 'rejects a path with ..' { (Invoke-Kshrd add x.test /a/../b 3000).Output | Should Match 'not a valid path' }
+    It 'rejects a path with odd characters' { (Invoke-Kshrd add x.test '/a;b' 3000).Output | Should Match 'not a valid path' }
+    It 'rejects a batch item with no target' { (Invoke-Kshrd add a.test:3000 b.test).Output | Should Match 'needs a target' }
+    It 'rejects add with no target' { (Invoke-Kshrd add x.test).ExitCode | Should Be 1 }
+    It 'fails on an unregistered route' { (Invoke-Kshrd remove no-such.test /api).ExitCode | Should Be 1 }
+}
+
+Describe 'Get-Routes and Compress-Routes' {
+    It 'has no routes for a placeholder' { (Get-Routes $null).Count | Should Be 0 }
+    It 'reads a plain port as the root route' { (Get-Routes 3000)['/'] | Should Be 3000 }
+    It 'reads routes loaded from JSON' {
+        $routes = Get-Routes ('{"/":3000,"/api":5000}' | ConvertFrom-Json)
+        $routes['/api'] | Should Be 5000
+        $routes.Count | Should Be 2
+    }
+    It 'stores a single root route as a plain value' {
+        $routes = [ordered]@{ '/' = 3000 }
+        Compress-Routes $routes | Should Be 3000
+    }
+    It 'keeps several routes' {
+        $routes = [ordered]@{ '/' = 3000; '/api' = 5000 }
+        (Compress-Routes $routes).Count | Should Be 2
+    }
+    It 'has nothing to store for no routes' {
+        Compress-Routes ([ordered]@{}) | Should BeNullOrEmpty
+    }
+}
+
+Describe 'Split-SiteSpec' {
+    It 'finds a host' {
+        $site = Split-SiteSpec 'shop.test'
+        $site.Hostname | Should Be 'shop.test'
+        $site.Path | Should BeNullOrEmpty
+    }
+    It 'finds a host and path, without a trailing slash' {
+        $site = Split-SiteSpec 'shop.test/api/'
+        $site.Hostname | Should Be 'shop.test'
+        $site.Path | Should Be '/api'
+    }
+}
+
+Describe 'New-SiteConfig routes' {
+    $config = New-SiteConfig 'shop.test' ([ordered]@{ '/' = 3000; '/api' = 5000 })
+    It 'has one upstream per route' {
+        $config | Should Match 'upstream shop\.test\.upstream \{'
+        $config | Should Match 'upstream shop\.test\.upstream1 \{'
+    }
+    It 'matches a path with and without its slash' {
+        $config | Should Match 'location = /api \{'
+        $config | Should Match 'location /api/ \{'
+    }
+    It 'keeps the path when calling the app' {
+        $config | Should Match 'proxy_pass http://shop\.test\.upstream1;'
+    }
+    It 'adds no catch-all when / is routed' { $config | Should Not Match 'return 404' }
+
+    It 'returns 404 for other paths when / is not routed' {
+        New-SiteConfig 'shop.test' ([ordered]@{ '/api' = 5000 }) | Should Match 'return 404'
+    }
+    It 'serves a folder at the root' {
+        $folder = New-SiteConfig 'docs.test' 'dir:D:/site/dist'
+        $folder | Should Match 'root "D:/site/dist"'
+        $folder | Should Not Match 'proxy_pass'
+        $folder | Should Not Match '__kshrd_502'
+    }
+    It 'serves a folder at a path' {
+        $folder = New-SiteConfig 'docs.test' ([ordered]@{ '/docs' = 'dir:D:/site' })
+        $folder | Should Match 'alias "D:/site/"'
+        $folder | Should Match 'return 301 /docs/'
+    }
+    It 'proxies another machine with no loopback fallback' {
+        $remote = New-SiteConfig 'db.test' '192.168.1.5:8080'
+        $remote | Should Match 'server 192\.168\.1\.5:8080 '
+        $remote | Should Not Match '::1'
+    }
+}
+
+Describe 'Test-RealDomain' {
+    Mock Resolve-DnsName { [pscustomobject]@{ Type = 'A' } }
+    It 'is true for a name DNS knows' { Test-RealDomain 'seyha.com' | Should Be $true }
+    It 'skips private endings without asking DNS' {
+        Test-RealDomain 'shop.test' | Should Be $false
+        Assert-MockCalled Resolve-DnsName -Exactly 0 -Scope It
+    }
+    It 'skips names under the shared domain' { Test-RealDomain 'demo.kshrd.app' | Should Be $false }
+    It 'is false when DNS has no answer' {
+        Mock Resolve-DnsName { throw 'no such name' }
+        Test-RealDomain 'nothing-here.example.com' | Should Be $false
+    }
+}
+
+Describe 'Project file errors' {
+    $here = Get-Location
+    BeforeEach { Set-Location $TestDrive }
+    AfterEach { Set-Location $here }
+    It 'fails without a file' {
+        Remove-Item (Join-Path $TestDrive 'kshrd.json') -ErrorAction SilentlyContinue
+        (Invoke-Kshrd up).Output | Should Match 'no kshrd\.json'
+    }
+    It 'fails on invalid JSON' {
+        [IO.File]::WriteAllText((Join-Path $TestDrive 'kshrd.json'), '{ nope')
+        (Invoke-Kshrd up).Output | Should Match 'not valid JSON'
+    }
+    It 'fails with no sites' {
+        [IO.File]::WriteAllText((Join-Path $TestDrive 'kshrd.json'), '{ "sites": {} }')
+        (Invoke-Kshrd down).Output | Should Match 'has no sites'
+    }
+}
+
+Describe 'List output' {
+    It 'prints valid JSON' {
+        $data = (Invoke-Kshrd list -Json).Output | ConvertFrom-Json
+        $data.version | Should Match '^\d+\.\d+\.\d+'
+        @($data.sites).Count -gt 0 | Should Be $true
+    }
+    It 'filters sites' {
+        $output = (Invoke-Kshrd list no-site-has-this-name).Output
+        $output | Should Match 'No sites match'
+    }
+}

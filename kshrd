@@ -7,4 +7,6 @@ if command -v cygpath >/dev/null 2>&1; then
 else
   win=$(wslpath -w "$dir")
 fi
+# Stop Git Bash rewriting a route like /api into a Windows path.
+export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 exec pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$win\kshrd.ps1" "$@"
