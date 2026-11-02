@@ -95,3 +95,54 @@ Describe 'Command line' {
     It 'lists commands in help' { (Invoke-Kshrd help).Output | Should Match 'Commands:' }
     It 'fails on an unknown command' { (Invoke-Kshrd nonsense).ExitCode | Should Be 1 }
 }
+
+Describe 'Test-CertNeedsRenewal' {
+    $CertDir = $TestDrive
+
+    function New-TestCert([string]$BaseName, [int]$Days, [switch]$NoKey) {
+        $rsa = [Security.Cryptography.RSA]::Create(2048)
+        $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=$BaseName", $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $now = [DateTimeOffset]::Now
+        $cert = $request.CreateSelfSigned($now.AddDays(-400), $now.AddDays($Days))
+        [IO.File]::WriteAllText((Join-Path $TestDrive "$BaseName.pem"), $cert.ExportCertificatePem())
+        if (-not $NoKey) { [IO.File]::WriteAllText((Join-Path $TestDrive "$BaseName-key.pem"), 'key') }
+    }
+
+    It 'keeps a certificate with plenty of time left' {
+        New-TestCert 'fresh' 200
+        Test-CertNeedsRenewal 'fresh' | Should Be $false
+    }
+    It 'renews one that expires soon' {
+        New-TestCert 'soon' 10
+        Test-CertNeedsRenewal 'soon' | Should Be $true
+    }
+    It 'renews an expired one' {
+        New-TestCert 'expired' -5
+        Test-CertNeedsRenewal 'expired' | Should Be $true
+    }
+    It 'renews when the certificate is missing' {
+        Test-CertNeedsRenewal 'absent' | Should Be $true
+    }
+    It 'renews when the key is missing' {
+        New-TestCert 'nokey' 200 -NoKey
+        Test-CertNeedsRenewal 'nokey' | Should Be $true
+    }
+    It 'renews when the file is not a certificate' {
+        [IO.File]::WriteAllText((Join-Path $TestDrive 'junk.pem'), 'not a certificate')
+        [IO.File]::WriteAllText((Join-Path $TestDrive 'junk-key.pem'), 'key')
+        Test-CertNeedsRenewal 'junk' | Should Be $true
+    }
+}
+
+Describe 'Get-CertTargets' {
+    $sites = [ordered]@{ 'kshrd.app' = $null; 'demo.kshrd.app' = 3000; 'shop.test' = 4000 }
+    $targets = @(Get-CertTargets $sites)
+    It 'has the shared certificate and one per custom domain' {
+        ($targets.BaseName -join ',') | Should Be 'kshrd.app,shop.test'
+    }
+    It 'covers subdomains with the shared certificate' {
+        $targets[0].Names -contains '*.kshrd.app' | Should Be $true
+    }
+}

@@ -10,6 +10,7 @@ param(
     [Parameter(Position = 2)][int]$Port,
     [switch]$RemoveCA,
     [switch]$ClearHosts,
+    [switch]$Force,
     [Alias('h')][switch]$Help,
     [Alias('v')][switch]$Version
 )
@@ -30,6 +31,7 @@ $HostsFile  = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
 $HostsBackup = Join-Path $Root 'hosts.backup'
 $BlockBegin = "# BEGIN $Domain"
 $BlockEnd   = "# END $Domain"
+$RenewDays  = 30
 
 function Fail([string]$Message) {
     Write-Host "error: $Message" -ForegroundColor Red
@@ -82,12 +84,66 @@ function Test-OwnCert([string]$Hostname) {
     $Hostname -notmatch "^([^.]+\.)?$([regex]::Escape($Domain))$"
 }
 
+function Get-CertExpiry([string]$Path) {
+    # Returns nothing if the file is missing or unreadable.
+    if (-not (Test-Path $Path)) { return }
+    try {
+        [Security.Cryptography.X509Certificates.X509Certificate2]::new($Path).NotAfter
+    } catch {
+        return
+    }
+}
+
+function Test-CertNeedsRenewal([string]$BaseName) {
+    $expiry = Get-CertExpiry (Join-Path $CertDir "$BaseName.pem")
+    if (-not $expiry -or -not (Test-Path (Join-Path $CertDir "$BaseName-key.pem"))) { return $true }
+    $expiry -lt (Get-Date).AddDays($RenewDays)
+}
+
+function Get-CertTargets($Sites) {
+    $targets = @([pscustomobject]@{ BaseName = $Domain; Names = @($Domain, "*.$Domain") })
+    foreach ($hostname in $Sites.Keys) {
+        if (Test-OwnCert $hostname) { $targets += [pscustomobject]@{ BaseName = $hostname; Names = @($hostname) } }
+    }
+    $targets
+}
+
+function Invoke-Mkcert([string]$BaseName, [string[]]$Names) {
+    # Issue to temporary files, so a failure leaves a working certificate in place.
+    $newCert = Join-Path $CertDir "$BaseName.new.pem"
+    $newKey = Join-Path $CertDir "$BaseName-key.new.pem"
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & (Get-Tool 'mkcert') -cert-file $newCert -key-file $newKey @Names 2>&1 | Out-String
+        $ok = $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if (-not $ok) {
+        Remove-Item $newCert, $newKey -Force -ErrorAction SilentlyContinue
+        Write-Host $output.Trim()
+        return $false
+    }
+    Move-Item $newCert (Join-Path $CertDir "$BaseName.pem") -Force
+    Move-Item $newKey (Join-Path $CertDir "$BaseName-key.pem") -Force
+    Write-Host ("Issued the certificate for {0}, valid until {1:yyyy-MM-dd}." -f $BaseName, (Get-CertExpiry (Join-Path $CertDir "$BaseName.pem")))
+    $true
+}
+
 function New-Cert([string]$BaseName, [string[]]$Names) {
-    $cert = Join-Path $CertDir "$BaseName.pem"
-    $key = Join-Path $CertDir "$BaseName-key.pem"
-    if ((Test-Path $cert) -and (Test-Path $key)) { return }
-    & (Get-Tool 'mkcert') -cert-file $cert -key-file $key @Names
-    if ($LASTEXITCODE -ne 0) { Fail "mkcert could not issue the certificate for $BaseName." }
+    if (-not (Test-CertNeedsRenewal $BaseName)) { return }
+    if (-not (Invoke-Mkcert $BaseName $Names)) { Fail "mkcert could not issue the certificate for $BaseName." }
+}
+
+function Update-Certs([switch]$All) {
+    # Returns how many were issued and how many failed.
+    $result = [pscustomobject]@{ Issued = 0; Failed = 0 }
+    foreach ($target in Get-CertTargets (Get-Sites)) {
+        if (-not $All -and -not (Test-CertNeedsRenewal $target.BaseName)) { continue }
+        if (Invoke-Mkcert $target.BaseName $target.Names) { $result.Issued++ } else { $result.Failed++ }
+    }
+    $result
 }
 
 function New-OwnCerts($Sites) {
@@ -314,6 +370,25 @@ function Show-Status {
     }
 }
 
+function Invoke-Renew {
+    if (-not (Test-Path (Join-Path $CertDir "$Domain.pem"))) { Fail "run 'kshrd setup' first." }
+    $result = Update-Certs -All:$Force
+    if ($result.Issued -and (Test-NginxRunning)) { Update-Nginx }
+    if ($result.Failed) { Fail "$($result.Failed) certificate(s) could not be issued." }
+    if (-not $result.Issued) { Write-Host "All certificates are valid for more than $RenewDays days. Use -Force to reissue them anyway." }
+}
+
+function Invoke-Start {
+    # After a reboot is the natural time to catch a certificate that is about to expire.
+    # A failure here must not stop nginx: the current certificate may still be valid.
+    if ((Test-Path (Join-Path $CertDir "$Domain.pem")) -and (Get-Command 'mkcert' -ErrorAction SilentlyContinue)) {
+        $result = Update-Certs
+        if ($result.Failed) { Write-Warning "$($result.Failed) certificate(s) could not be renewed." }
+        if ($result.Issued -and (Test-NginxRunning)) { Update-Nginx }
+    }
+    Start-Nginx
+}
+
 function Invoke-Setup {
     $mkcert = Get-Tool 'mkcert'
     Get-Tool 'nginx' | Out-Null
@@ -460,6 +535,15 @@ $HelpTopics = [ordered]@{
             @('kshrd teardown -RemoveCA', 'Also remove the local CA')
         )
     }
+    renew    = @{
+        Usage    = 'kshrd renew [-Force]'
+        Summary  = 'Reissue certificates that expire soon'
+        Details  = "Reissues any certificate that is missing or has less than $RenewDays days left, then reloads nginx. kshrd start and kshrd setup do this too. -Force reissues every certificate."
+        Examples = @(
+            @('kshrd renew', 'Reissue certificates that need it'),
+            @('kshrd renew -Force', 'Reissue all certificates')
+        )
+    }
     version  = @{
         Usage    = 'kshrd version'
         Summary  = 'Show the kshrd version'
@@ -544,9 +628,10 @@ switch ($Command.ToLowerInvariant()) {
     'remove'       { Invoke-Remove }
     'list'         { Show-Status }
     'status'       { Show-Status }
-    'start'        { Start-Nginx }
+    'start'        { Invoke-Start }
     'stop'         { Stop-Nginx }
-    'restart'      { Stop-Nginx; Start-Nginx }
+    'restart'      { Stop-Nginx; Invoke-Start }
+    'renew'        { Invoke-Renew }
     'teardown'     { Invoke-Teardown }
     'version'      { Write-Host "kshrd $AppVersion" }
     'help'         { Show-Help $Name }
