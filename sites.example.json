@@ -1,0 +1,10 @@
+{
+  "kshrd.app": null,
+  "demo.kshrd.app": 3000,
+  "shop.test": {
+    "/": 3000,
+    "/api": 5000
+  },
+  "docs.test": "dir:D:/projects/docs/dist",
+  "db.test": "192.168.1.5:8080"
+}
