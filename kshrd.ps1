@@ -11,6 +11,8 @@ param(
     [switch]$RemoveCA,
     [switch]$ClearHosts,
     [switch]$Force,
+    [Alias('f')][switch]$Follow,
+    [switch]$Errors,
     [Alias('h')][switch]$Help,
     [Alias('v')][switch]$Version
 )
@@ -32,6 +34,8 @@ $HostsBackup = Join-Path $Root 'hosts.backup'
 $BlockBegin = "# BEGIN $Domain"
 $BlockEnd   = "# END $Domain"
 $RenewDays  = 30
+$RunKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$LogDir     = Join-Path $Root 'nginx\logs'
 
 function Fail([string]$Message) {
     Write-Host "error: $Message" -ForegroundColor Red
@@ -157,6 +161,8 @@ function New-SiteConfig([string]$Hostname, $AppPort) {
     listen ${ListenIp}:443 ssl;
     http2 on;
     server_name $Hostname;
+    access_log logs/$Hostname.access.log;
+    error_log logs/$Hostname.error.log;
 "@
     if (Test-OwnCert $Hostname) {
         $tls += @"
@@ -386,7 +392,67 @@ function Invoke-Start {
         if ($result.Failed) { Write-Warning "$($result.Failed) certificate(s) could not be renewed." }
         if ($result.Issued -and (Test-NginxRunning)) { Update-Nginx }
     }
+    # Pick up changes to the generated config after kshrd itself is updated.
+    if (-not (Test-NginxRunning)) { Write-SiteConfigs (Get-Sites) }
     Start-Nginx
+}
+
+function Get-RegisteredHostname {
+    $hostname = Resolve-Hostname $Name
+    if (-not (Get-Sites).Contains($hostname)) { Fail "$hostname is not registered. Run 'kshrd list' to see the sites." }
+    $hostname
+}
+
+function Invoke-Open {
+    $hostname = Get-RegisteredHostname
+    if (-not (Test-NginxRunning)) { Fail "nginx is not running. Run 'kshrd start' first." }
+    Start-Process "https://$hostname"
+    Write-Host "Opened https://$hostname"
+}
+
+function Invoke-Logs {
+    $hostname = Get-RegisteredHostname
+    $access = Join-Path $LogDir "$hostname.access.log"
+    $errorLog = Join-Path $LogDir "$hostname.error.log"
+    if ($Follow) {
+        $path = if ($Errors) { $errorLog } else { $access }
+        if (-not (Test-Path $path)) { Fail "no log for $hostname yet. If nginx has been running since before this update, run 'kshrd restart'." }
+        Write-Host "Following $path. Press Ctrl+C to stop."
+        Get-Content $path -Tail 20 -Wait
+        return
+    }
+    $sections = [ordered]@{}
+    if (-not $Errors) { $sections['Requests'] = $access }
+    $sections['Errors'] = $errorLog
+    foreach ($title in $sections.Keys) {
+        Write-Host "== $title =="
+        $lines = if (Test-Path $sections[$title]) { Get-Content $sections[$title] -Tail 30 }
+        if ($lines) { $lines | Write-Host } else { Write-Host '(empty)' }
+    }
+}
+
+function Get-AutostartCommand {
+    (Get-ItemProperty -Path $RunKey -Name 'kshrd' -ErrorAction SilentlyContinue).kshrd
+}
+
+function Invoke-Autostart {
+    $action = if ($Name) { $Name.ToLowerInvariant() } else { 'status' }
+    switch ($action) {
+        'on' {
+            $shell = (Get-Process -Id $PID).Path
+            $value = "`"$shell`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" start"
+            Set-ItemProperty -Path $RunKey -Name 'kshrd' -Value $value
+            Write-Host 'nginx will start when you log in to Windows.'
+        }
+        'off' {
+            Remove-ItemProperty -Path $RunKey -Name 'kshrd' -ErrorAction SilentlyContinue
+            Write-Host 'nginx will no longer start when you log in.'
+        }
+        'status' {
+            Write-Host ('Autostart is {0}.' -f $(if (Get-AutostartCommand) { 'on' } else { 'off' }))
+        }
+        default { Fail 'usage: kshrd autostart [on|off|status]' }
+    }
 }
 
 function Get-HostsAddresses([string]$Hostname, [string]$Text) {
@@ -556,6 +622,11 @@ function Invoke-Doctor {
         }
     }
 
+    $autostart = Get-AutostartCommand
+    if ($autostart -and -not $autostart.Contains("`"$PSCommandPath`"")) {
+        Write-Check warn 'autostart points at a different copy of kshrd' 'kshrd autostart on'
+    }
+
     Write-Host ''
     Write-Host "$($script:DoctorFailures) problem(s), $($script:DoctorWarnings) warning(s)."
     if ($script:DoctorFailures) { exit 1 }
@@ -629,6 +700,10 @@ function Invoke-Remove {
     if (Test-OwnCert $hostname) {
         Remove-Item (Join-Path $CertDir "$hostname.pem"), (Join-Path $CertDir "$hostname-key.pem") -Force -ErrorAction SilentlyContinue
     }
+    if ($hostname -ne $Domain) {
+        # A worker that is still finishing may hold these open, so this is best effort.
+        Remove-Item (Join-Path $LogDir "$hostname.access.log"), (Join-Path $LogDir "$hostname.error.log") -Force -ErrorAction SilentlyContinue
+    }
     Write-Host "Removed $hostname."
 }
 
@@ -668,6 +743,25 @@ $HelpTopics = [ordered]@{
             @('kshrd remove demo', "Stop serving https://demo.$Domain")
         )
     }
+    open     = @{
+        Usage    = 'kshrd open <name>'
+        Summary  = 'Open a site in your default browser'
+        Details  = '<name> is written the same way as for kshrd add.'
+        Examples = @(
+            @('kshrd open shop.test', 'Open https://shop.test'),
+            @('kshrd open demo', "Open https://demo.$Domain")
+        )
+    }
+    logs     = @{
+        Usage    = 'kshrd logs <name> [-Follow] [-Errors]'
+        Summary  = 'Show the recent requests and errors for one site'
+        Details  = 'Shows the last 30 lines of each log. -Follow (or -f) keeps watching the requests until you press Ctrl+C. -Errors shows only the errors, and can be combined with -Follow.'
+        Examples = @(
+            @('kshrd logs shop.test', 'Show recent requests and errors'),
+            @('kshrd logs shop.test -f', 'Watch requests as they arrive'),
+            @('kshrd logs shop.test -Errors', 'Show only the errors')
+        )
+    }
     list     = @{
         Usage    = 'kshrd list'
         Summary  = 'Show nginx, each site, and whether its app is up'
@@ -683,7 +777,7 @@ $HelpTopics = [ordered]@{
     start    = @{
         Usage    = 'kshrd start'
         Summary  = 'Start nginx'
-        Details  = 'nginx does not start with Windows, so run this after a reboot.'
+        Details  = 'Also renews certificates that expire soon. Run this after a reboot, or use kshrd autostart on.'
         Examples = @(, @('kshrd start', 'Start serving sites'))
     }
     stop     = @{
@@ -705,6 +799,15 @@ $HelpTopics = [ordered]@{
         Examples = @(
             @('kshrd teardown', 'Stop nginx and remove the hosts entries'),
             @('kshrd teardown -RemoveCA', 'Also remove the local CA')
+        )
+    }
+    autostart = @{
+        Usage    = 'kshrd autostart [on|off|status]'
+        Summary  = 'Start nginx when you log in to Windows'
+        Details  = 'Applies to your Windows user only and needs no admin rights. If you move this folder, run kshrd autostart on again.'
+        Examples = @(
+            @('kshrd autostart on', 'Start nginx at every login'),
+            @('kshrd autostart off', 'Go back to starting it by hand')
         )
     }
     doctor   = @{
@@ -763,22 +866,25 @@ function Show-Help([string]$Topic) {
     Write-Host ''
     Write-Host 'Commands:'
     foreach ($key in $HelpTopics.Keys) {
-        Write-Host ('  {0,-28} {1}' -f $HelpTopics[$key].Usage.Substring(6), $HelpTopics[$key].Summary)
+        Write-Host ('  {0,-36} {1}' -f $HelpTopics[$key].Usage.Substring(6), $HelpTopics[$key].Summary)
     }
     Write-Host ''
     Write-Host 'Names:'
-    Write-Host ('  {0,-28} {1}' -f 'demo', "A subdomain: https://demo.$Domain")
-    Write-Host ('  {0,-28} {1}' -f $Domain, 'The main site')
-    Write-Host ('  {0,-28} {1}' -f 'shop.test', 'A custom domain, used exactly as written, with its own certificate')
+    Write-Host ('  {0,-36} {1}' -f 'demo', "A subdomain: https://demo.$Domain")
+    Write-Host ('  {0,-36} {1}' -f $Domain, 'The main site')
+    Write-Host ('  {0,-36} {1}' -f 'shop.test', 'A custom domain, used exactly as written, with its own certificate')
     Write-Host ''
     Write-Examples @(
         @('kshrd setup', 'First run on this PC'),
         @('kshrd add shop.test 3000', 'https://shop.test -> localhost:3000'),
         @('kshrd add demo 3000', "https://demo.$Domain -> localhost:3000"),
         @("kshrd add $Domain 3000", "https://$Domain -> localhost:3000"),
+        @('kshrd open shop.test', 'Open it in the browser'),
+        @('kshrd logs shop.test -f', 'Watch its requests'),
         @('kshrd list', 'Check nginx and each site'),
+        @('kshrd doctor', 'Find out why something is not working'),
         @('kshrd remove shop.test', 'Remove a site'),
-        @('kshrd start', 'Start nginx again after a reboot')
+        @('kshrd autostart on', 'Start nginx at every login')
     )
     Write-Host ''
     Write-Host "Run 'kshrd help <command>' for details."
@@ -811,6 +917,9 @@ switch ($Command.ToLowerInvariant()) {
     'restart'      { Stop-Nginx; Invoke-Start }
     'renew'        { Invoke-Renew }
     'doctor'       { Invoke-Doctor }
+    'open'         { Invoke-Open }
+    'logs'         { Invoke-Logs }
+    'autostart'    { Invoke-Autostart }
     'teardown'     { Invoke-Teardown }
     'version'      { Write-Host "kshrd $AppVersion" }
     'help'         { Show-Help $Name }

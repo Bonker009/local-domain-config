@@ -157,3 +157,41 @@ Describe 'Get-HostsAddresses' {
     It 'ignores trailing comments' { Get-HostsAddresses 'e.test' $text | Should BeNullOrEmpty }
     It 'does not match the address itself' { Get-HostsAddresses '127.0.0.1' $text | Should BeNullOrEmpty }
 }
+
+Describe 'Per-site logs' {
+    It 'gives a proxied site its own logs' {
+        $config = New-SiteConfig 'shop.test' 3000
+        $config | Should Match 'access_log logs/shop\.test\.access\.log'
+        $config | Should Match 'error_log logs/shop\.test\.error\.log'
+    }
+    It 'gives the placeholder site its own logs' {
+        New-SiteConfig 'kshrd.app' $null | Should Match 'access_log logs/kshrd\.app\.access\.log'
+    }
+}
+
+Describe 'Commands that need a registered site' {
+    foreach ($command in 'open', 'logs') {
+        It "$command rejects an unregistered name" {
+            $result = Invoke-Kshrd $command 'no-such-site.test'
+            $result.ExitCode | Should Be 1
+            $result.Output | Should Match 'not registered'
+        }
+    }
+    It 'autostart rejects an unknown action' {
+        (Invoke-Kshrd autostart maybe).ExitCode | Should Be 1
+    }
+}
+
+Describe 'kshrd logs sections' {
+    # kshrd.app is always registered, and reading its logs changes nothing.
+    It 'shows both sections by default' {
+        $output = (Invoke-Kshrd logs kshrd.app).Output
+        $output | Should Match '== Requests =='
+        $output | Should Match '== Errors =='
+    }
+    It 'shows only errors with -Errors' {
+        $output = (Invoke-Kshrd logs kshrd.app -Errors).Output
+        $output | Should Match '== Errors =='
+        $output | Should Not Match '== Requests =='
+    }
+}

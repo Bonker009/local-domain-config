@@ -16,13 +16,21 @@ kshrd add demo 3000         https://demo.kshrd.app -> localhost:3000
 kshrd add kshrd.app 3000    https://kshrd.app -> localhost:3000
 kshrd add shop.test 3000    https://shop.test -> localhost:3000 (any full domain name)
 kshrd remove demo           Remove a site
+kshrd open shop.test        Open a site in the browser
+kshrd logs shop.test        Show its recent requests and errors (-f to keep watching, -Errors for errors only)
 kshrd status                Show nginx, each site, and whether its app is up
+kshrd doctor                Check for problems and suggest a fix for each
+kshrd renew                 Reissue certificates that expire soon (-Force for all of them)
+kshrd autostart on          Start nginx when you log in (off, status)
+kshrd version               Show the version
 kshrd start | stop | restart
 kshrd teardown              Stop nginx and remove the hosts entries
 kshrd teardown -RemoveCA    Also remove the local CA from the trust store
 ```
 
-nginx does not start with Windows. After a reboot, run `kshrd start`.
+nginx does not start with Windows unless you run `kshrd autostart on`. Otherwise, run `kshrd start` after a reboot.
+
+Certificates last a little over two years. `kshrd start` and `kshrd setup` reissue any that have under 30 days left, and `kshrd doctor` warns about them.
 
 Changing the hosts file shows a Windows admin prompt. Nothing else needs admin rights.
 
@@ -42,9 +50,15 @@ A name containing a dot is used as the full domain. It gets its own certificate 
 
 ## Troubleshooting
 
+Run `kshrd doctor` first. It checks everything below and suggests a fix.
+
 | Symptom | Fix |
 |---|---|
 | Certificate warning | Run `kshrd setup` again and restart the browser |
 | "This app isn't running" page | Start the app, and check the port with `kshrd status` |
 | 403 or "host not allowed" from the app | See dev server host checks above |
 | nginx won't start | Another program is using port 80 or 443. See `nginx/logs/error.log` |
+
+## Development
+
+Run the tests with `Invoke-Pester .\tests`. They don't touch the real hosts file, nginx or certificates.
