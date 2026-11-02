@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 # Unset, this would count as one empty argument.
 $Rest = @($Rest | Where-Object { $_ })
 
-$AppVersion = '1.2.0'
+$AppVersion = '1.2.1'
 $Domain     = 'kshrd.app'
 # Traefik (Docker) owns the wildcard on 80/443. A dedicated loopback address keeps both proxies working.
 $ListenIp   = '127.0.0.2'
@@ -1154,7 +1154,7 @@ $HelpTopics = [ordered]@{
         Examples = @(, @('kshrd setup', 'Prepare this PC'))
     }
     add      = @{
-        Usage    = 'kshrd add <name> [/path] <target>'
+        Usage    = 'kshrd add <name> [/path] <target> [-Yes]'
         Summary  = 'Point a site or path at an app, machine or folder, or change it'
         Details  = "<name> is a subdomain, $Domain for the main site, or a full custom domain, which gets its own certificate. <target> is a local port, a host:port on another machine, or a folder to serve. A /path route keeps the path when it calls the app, so /api/users arrives as /api/users. Several name:target pairs can be added at once with one admin prompt. kshrd asks first if the name is a real website or nothing responds at the target; -Yes skips the question. Prefer the reserved .test ending for made-up names."
         Examples = @(
@@ -1331,6 +1331,14 @@ function Show-Help([string]$Topic) {
         , @((New-Cell 'demo' 'Cyan'), (New-Cell "A subdomain: https://demo.$Domain" ''))
         , @((New-Cell $Domain 'Cyan'), (New-Cell 'The main site' ''))
         , @((New-Cell 'shop.test' 'Cyan'), (New-Cell 'A custom domain, used exactly as written, with its own certificate' ''))
+        , @((New-Cell 'api.shop.test' 'Cyan'), (New-Cell 'A subdomain of a custom domain. Add each one by its full name' ''))
+    )
+    Write-Host ''
+    Write-Heading 'Targets:'
+    Write-Table @('Target', 'Meaning') @(
+        , @((New-Cell '3000' 'Cyan'), (New-Cell 'An app on this PC, at localhost:3000' ''))
+        , @((New-Cell '192.168.1.5:8080' 'Cyan'), (New-Cell 'An app on another machine' ''))
+        , @((New-Cell './dist' 'Cyan'), (New-Cell 'A folder of files to serve' ''))
     )
     Write-Host ''
     Write-Examples @(
@@ -1339,13 +1347,17 @@ function Show-Help([string]$Topic) {
         @('kshrd add demo 3000', "https://demo.$Domain -> localhost:3000"),
         @('kshrd add shop.test /api 5000', 'https://shop.test/api -> localhost:5000'),
         @('kshrd add docs.test ./dist', 'https://docs.test -> the dist folder'),
+        @('kshrd add db.test 192.168.1.5:8080', 'https://db.test -> another machine'),
         @('kshrd add a.test:3000 b.test:4000', 'Add both with one admin prompt'),
         @('kshrd up', "Add the sites in this folder's kshrd.json"),
         @('kshrd open shop.test', 'Open it in the browser'),
         @('kshrd logs shop.test -f', 'Watch its requests'),
+        @('kshrd logs shop.test -Clear', 'Empty its logs'),
         @('kshrd list', 'Check nginx and each site'),
+        @('kshrd list shop', 'Show only the sites matching shop'),
         @('kshrd doctor', 'Find out why something is not working'),
         @('kshrd remove shop.test', 'Remove a site'),
+        @('kshrd remove shop.test /api', 'Remove only the /api route'),
         @('kshrd autostart on', 'Start nginx at every login')
     )
     Write-Host ''

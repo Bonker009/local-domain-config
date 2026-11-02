@@ -423,3 +423,13 @@ Describe 'List output' {
         $output | Should Match 'No sites match'
     }
 }
+
+Describe 'Main help' {
+    $output = (Invoke-Kshrd help).Output
+    It 'explains targets' { $output | Should Match 'Targets:' }
+    It 'lists every command' {
+        foreach ($command in 'setup', 'add', 'up', 'down', 'remove', 'open', 'logs', 'list', 'status', 'start', 'stop', 'restart', 'teardown', 'autostart', 'doctor', 'renew', 'version', 'help') {
+            $output | Should Match "\| $command\b"
+        }
+    }
+}
