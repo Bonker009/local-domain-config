@@ -146,3 +146,14 @@ Describe 'Get-CertTargets' {
         $targets[0].Names -contains '*.kshrd.app' | Should Be $true
     }
 }
+
+Describe 'Get-HostsAddresses' {
+    $text = "127.0.0.1 a.test b.test``
+# 127.0.0.2 c.test``
+127.0.0.2 d.test # 127.0.0.9 e.test``
+"
+    It 'finds a name anywhere on the line' { Get-HostsAddresses 'b.test' $text | Should Be '127.0.0.1' }
+    It 'ignores commented lines' { Get-HostsAddresses 'c.test' $text | Should BeNullOrEmpty }
+    It 'ignores trailing comments' { Get-HostsAddresses 'e.test' $text | Should BeNullOrEmpty }
+    It 'does not match the address itself' { Get-HostsAddresses '127.0.0.1' $text | Should BeNullOrEmpty }
+}

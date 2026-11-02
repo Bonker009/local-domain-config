@@ -389,6 +389,178 @@ function Invoke-Start {
     Start-Nginx
 }
 
+function Get-HostsAddresses([string]$Hostname, [string]$Text) {
+    # The addresses that active lines in the hosts file give this name.
+    foreach ($line in $Text -split "\r?\n") {
+        $fields = @(($line -replace '#.*$', '').Trim() -split '\s+')
+        if ($fields.Count -ge 2 -and $fields[1..($fields.Count - 1)] -contains $Hostname) { $fields[0] }
+    }
+}
+
+function Test-CertChain([string]$CertPath, [string]$CaPath) {
+    # True if the certificate was issued by this CA.
+    $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($CertPath)
+    $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        $chain.ChainPolicy.TrustMode = 'CustomRootTrust'
+        $chain.ChainPolicy.RevocationMode = 'NoCheck'
+        # Expiry is reported separately.
+        $chain.ChainPolicy.VerificationFlags = 'IgnoreNotTimeValid'
+        [void]$chain.ChainPolicy.CustomTrustStore.Add([Security.Cryptography.X509Certificates.X509Certificate2]::new($CaPath))
+        $chain.Build($cert)
+    } finally {
+        $chain.Dispose()
+    }
+}
+
+function Get-TlsError([string]$Hostname) {
+    # Connects as a browser would, trusting what Windows trusts. Returns nothing on success.
+    $client = [Net.Sockets.TcpClient]::new()
+    try {
+        if (-not $client.ConnectAsync($ListenIp, 443).Wait(1000)) { return 'connection timed out' }
+        $stream = [Net.Security.SslStream]::new($client.GetStream())
+        try {
+            if (-not $stream.AuthenticateAsClientAsync($Hostname).Wait(3000)) { return 'handshake timed out' }
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        $problem = $_.Exception
+        while ($problem.InnerException) { $problem = $problem.InnerException }
+        return $problem.Message
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Write-Check([ValidateSet('ok', 'warn', 'fail')][string]$Level, [string]$Message, [string]$Fix) {
+    $label, $color = switch ($Level) {
+        'ok'   { 'ok  ', 'Green' }
+        'warn' { 'warn', 'Yellow' }
+        'fail' { 'FAIL', 'Red'; $script:DoctorFailures++ }
+    }
+    if ($Level -eq 'warn') { $script:DoctorWarnings++ }
+    Write-Host '[' -NoNewline
+    Write-Host $label -NoNewline -ForegroundColor $color
+    Write-Host "] $Message"
+    if ($Fix) { Write-Host "       fix: $Fix" }
+}
+
+function Invoke-Doctor {
+    $script:DoctorFailures = 0
+    $script:DoctorWarnings = 0
+
+    $toolsOk = $true
+    foreach ($tool in 'nginx', 'mkcert') {
+        $found = Get-Command $tool -ErrorAction SilentlyContinue
+        if ($found) {
+            Write-Check ok "$tool found"
+        } else {
+            $toolsOk = $false
+            Write-Check fail "$tool is not installed or not on PATH" "install $tool, then open a new terminal"
+        }
+    }
+
+    $sites = [ordered]@{}
+    try {
+        $sites = Get-Sites
+        Write-Check ok "sites.json lists $($sites.Count) site(s)"
+    } catch {
+        Write-Check fail "sites.json can't be read: $($_.Exception.Message)" 'correct the file, or restore it with git'
+    }
+
+    # CA trust
+    $caPath = $null
+    if ($toolsOk) {
+        $caPath = Join-Path "$(& mkcert -CAROOT)".Trim() 'rootCA.pem'
+        if (-not (Test-Path $caPath)) {
+            $caPath = $null
+            Write-Check fail 'the local CA does not exist' 'kshrd setup'
+        } else {
+            $thumbprint = [Security.Cryptography.X509Certificates.X509Certificate2]::new($caPath).Thumbprint
+            if ((Test-Path "Cert:\CurrentUser\Root\$thumbprint") -or (Test-Path "Cert:\LocalMachine\Root\$thumbprint")) {
+                Write-Check ok 'the local CA is trusted by Windows'
+            } else {
+                Write-Check fail 'the local CA is not trusted by Windows' 'kshrd setup, then restart the browser'
+            }
+        }
+    }
+
+    # Certificates
+    foreach ($target in Get-CertTargets $sites) {
+        $path = Join-Path $CertDir "$($target.BaseName).pem"
+        $expiry = Get-CertExpiry $path
+        if (-not $expiry -or -not (Test-Path (Join-Path $CertDir "$($target.BaseName)-key.pem"))) {
+            Write-Check fail "certificate for $($target.BaseName) is missing or unreadable" 'kshrd renew'
+        } elseif ($expiry -lt (Get-Date)) {
+            Write-Check fail "certificate for $($target.BaseName) expired on $($expiry.ToString('yyyy-MM-dd'))" 'kshrd renew'
+        } elseif ($caPath -and -not (Test-CertChain $path $caPath)) {
+            Write-Check fail "certificate for $($target.BaseName) was issued by a different CA" 'kshrd renew -Force'
+        } elseif ($expiry -lt (Get-Date).AddDays($RenewDays)) {
+            Write-Check warn "certificate for $($target.BaseName) expires on $($expiry.ToString('yyyy-MM-dd'))" 'kshrd renew'
+        } else {
+            Write-Check ok "certificate for $($target.BaseName) is valid until $($expiry.ToString('yyyy-MM-dd'))"
+        }
+    }
+
+    # nginx
+    $running = Test-NginxRunning
+    if ($toolsOk) {
+        if (Test-NginxConfig) {
+            Write-Check ok 'nginx config is valid'
+        } else {
+            Write-Check fail 'nginx config is invalid (details above)' 'kshrd setup regenerates the site configs'
+        }
+    }
+    if ($running) {
+        Write-Check ok 'nginx is running'
+    } else {
+        Write-Check fail 'nginx is not running' 'kshrd start'
+    }
+    foreach ($listenPort in 80, 443) {
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $listenPort -ErrorAction SilentlyContinue |
+            Where-Object LocalAddress -eq $ListenIp)
+        $others = @($listeners | ForEach-Object { (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName } |
+            Where-Object { $_ -ne 'nginx' } | Sort-Object -Unique)
+        if ($others) {
+            Write-Check fail "port $listenPort on $ListenIp is used by $($others -join ', ')" 'stop that program, then run kshrd restart'
+        } elseif ($running -and -not $listeners) {
+            Write-Check fail "nginx is not listening on ${ListenIp}:$listenPort" 'kshrd restart, and see nginx/logs/error.log'
+        } else {
+            Write-Check ok "port $listenPort on $ListenIp is available to nginx"
+        }
+    }
+
+    # Each site
+    $hostsText = [IO.File]::ReadAllText($HostsFile)
+    foreach ($hostname in $sites.Keys) {
+        $addresses = @(Get-HostsAddresses $hostname $hostsText)
+        if (-not $addresses) {
+            Write-Check fail "$hostname is not in the hosts file" 'kshrd setup'
+        } elseif ($addresses[0] -ne $ListenIp) {
+            Write-Check warn "$hostname goes to $($addresses[0]) instead of this proxy" 'delete that line from the hosts file, then run kshrd setup'
+            continue
+        }
+        if ($running) {
+            $tlsError = Get-TlsError $hostname
+            if ($tlsError) {
+                Write-Check fail "$hostname HTTPS check failed: $tlsError" 'kshrd renew -Force, then restart the browser'
+                continue
+            }
+        }
+        $appPort = $sites[$hostname]
+        if ($null -ne $appPort -and -not (Test-Port $appPort)) {
+            Write-Check warn "$hostname has no app on port $appPort" "start the app, or change the port with: kshrd add $hostname <port>"
+        } elseif ($addresses) {
+            Write-Check ok "$hostname is working$(if (-not $running) { ' (HTTPS not checked: nginx is stopped)' })"
+        }
+    }
+
+    Write-Host ''
+    Write-Host "$($script:DoctorFailures) problem(s), $($script:DoctorWarnings) warning(s)."
+    if ($script:DoctorFailures) { exit 1 }
+}
+
 function Invoke-Setup {
     $mkcert = Get-Tool 'mkcert'
     Get-Tool 'nginx' | Out-Null
@@ -535,6 +707,12 @@ $HelpTopics = [ordered]@{
             @('kshrd teardown -RemoveCA', 'Also remove the local CA')
         )
     }
+    doctor   = @{
+        Usage    = 'kshrd doctor'
+        Summary  = 'Check for problems and suggest a fix for each'
+        Details  = 'Checks the tools, CA trust, certificates, nginx, ports, hosts entries and a real HTTPS connection to each site. Changes nothing. Exits with 1 if it finds a problem; warnings do not count.'
+        Examples = @(, @('kshrd doctor', 'Check everything'))
+    }
     renew    = @{
         Usage    = 'kshrd renew [-Force]'
         Summary  = 'Reissue certificates that expire soon'
@@ -632,6 +810,7 @@ switch ($Command.ToLowerInvariant()) {
     'stop'         { Stop-Nginx }
     'restart'      { Stop-Nginx; Invoke-Start }
     'renew'        { Invoke-Renew }
+    'doctor'       { Invoke-Doctor }
     'teardown'     { Invoke-Teardown }
     'version'      { Write-Host "kshrd $AppVersion" }
     'help'         { Show-Help $Name }
